@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-StealthPlayer — privacy-focused FFmpeg video player (no history).
+PPlayer — privacy-focused FFmpeg video player (no history).
 Required : Python 3.7+, Pillow (pip install Pillow)
 Optional : tkinterdnd2        (pip install tkinterdnd2) for drag-and-drop
 FFmpeg is searched in PATH first, then in ./lib/ beside this script.
@@ -12,7 +12,7 @@ import subprocess, threading, time, os, sys, platform, json, queue, shutil, re
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
 except ImportError:
     print("Pillow is required:  pip install Pillow")
     sys.exit(1)
@@ -32,7 +32,7 @@ except AttributeError:
 # ━━━━━━━━━━━━━━━━━━━ i18n ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _L = {
     "en": {
-        "title": "Player",
+        "title": "PPlayer",
         "file": "File",
         "open": "Open File…",
         "open_path": "Open Path / URL…",
@@ -55,13 +55,27 @@ _L = {
         "settings": "Settings",
         "lang": "Language",
         "boss": "Boss Key…",
+        "boss_any": "Any-Key Exit",
+        "boss_any_tip": "Press any non-control key to exit",
         "opa": "Opacity",
         "hw": "Hardware Decode",
         "hwa": "Auto",
         "hwd": "Disabled",
+        "sub": "Subtitle",
+        "sub_off": "Off",
+        "sub_ext": "Load External…",
         "help": "Help",
         "about": "About",
-        "abt": "StealthPlayer\nFFmpeg-based video player\nNo playback history is ever recorded.",
+        "abt": (
+            "PPlayer\n"
+            "FFmpeg-based video player\n"
+            "No playback history is ever recorded.\n\n"
+            "This software uses FFmpeg, a complete cross-platform\n"
+            "solution to record, convert and stream audio and video.\n"
+            "FFmpeg is free software licensed under the LGPL/GPL.\n"
+            "Copyright (c) the FFmpeg developers.\n"
+            "https://ffmpeg.org  |  https://ffmpeg.org/legal.html"
+        ),
         "hint": "Drop a video file here\nor use  File → Open",
         "hint_nodnd": "Use  File → Open  to play a video",
         "htag": "HW: {}",
@@ -74,7 +88,7 @@ _L = {
         "cancel": "Cancel",
     },
     "zh": {
-        "title": "播放器",
+        "title": "PPlayer",
         "file": "文件",
         "open": "打开文件…",
         "open_path": "打开路径/URL…",
@@ -97,13 +111,27 @@ _L = {
         "settings": "设置",
         "lang": "语言",
         "boss": "老板键…",
+        "boss_any": "任意键退出",
+        "boss_any_tip": "按任意非控制键退出",
         "opa": "透明度",
         "hw": "硬件解码",
         "hwa": "自动",
         "hwd": "禁用",
+        "sub": "字幕",
+        "sub_off": "关闭",
+        "sub_ext": "加载外部字幕…",
         "help": "帮助",
         "about": "关于",
-        "abt": "StealthPlayer\n基于 FFmpeg 的视频播放器\n不记录任何播放历史。",
+        "abt": (
+            "PPlayer\n"
+            "基于 FFmpeg 的视频播放器\n"
+            "不记录任何播放历史。\n\n"
+            "本软件使用 FFmpeg —— 完整的跨平台音视频\n"
+            "录制、转换与流媒体解决方案。\n"
+            "FFmpeg 是基于 LGPL/GPL 许可的自由软件。\n"
+            "Copyright (c) FFmpeg 开发者。\n"
+            "https://ffmpeg.org  |  https://ffmpeg.org/legal.html"
+        ),
         "hint": "拖放视频文件到此处\n或使用  文件→打开",
         "hint_nodnd": "使用  文件→打开  来播放视频",
         "htag": "硬解: {}",
@@ -179,8 +207,9 @@ def _probe(ffprobe, path):
         return None
 
     info = dict(duration=0.0, width=0, height=0, fps=30.0,
-                has_audio=False, vcodec="")
+                has_audio=False, vcodec="", subs=[])
     info["duration"] = float(d.get("format", {}).get("duration", 0))
+    sub_idx = 0
     for s in d.get("streams", []):
         ct = s.get("codec_type")
         if ct == "video" and info["width"] == 0:
@@ -200,6 +229,22 @@ def _probe(ffprobe, path):
                 info["fps"] = 30.0
         elif ct == "audio":
             info["has_audio"] = True
+        elif ct == "subtitle":
+            tags = s.get("tags", {})
+            lang = tags.get("language", tags.get("title", f"#{sub_idx}"))
+            title = tags.get("title", "")
+            label = f"#{sub_idx}"
+            if title:
+                label += f" {title}"
+            if lang and lang != title:
+                label += f" ({lang})"
+            info["subs"].append({
+                "index": int(s.get("index", sub_idx)),
+                "stream_idx": sub_idx,
+                "label": label,
+                "codec": s.get("codec_name", ""),
+            })
+            sub_idx += 1
     return info if info["width"] > 0 else None
 
 
@@ -255,6 +300,7 @@ class _Bar(tk.Canvas):
         self.pos = 0.0
         self._drag = False
         self.on_seek = None
+        self.on_drag_start = None
         self.on_drag_pos = None
         self.on_hover = None
         self.on_leave_cb = None
@@ -297,6 +343,8 @@ class _Bar(tk.Canvas):
         self._drag = True
         self.pos = self._t(e.x)
         self._draw()
+        if self.on_drag_start:
+            self.on_drag_start()
         if self.on_leave_cb:
             self.on_leave_cb()
         if self.on_drag_pos:
@@ -371,6 +419,19 @@ class _Tip:
 class Player:
     SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
+    # Keys that have control functions — NOT triggering boss-any-key exit
+    _CONTROL_KEYS = {
+        "space", "Left", "Right", "Up", "Down",
+        "m", "M", "f", "F", "F11", "period",
+        "bracketleft", "bracketright",
+        "Return", "Tab", "Shift_L", "Shift_R",
+        "Control_L", "Control_R", "Alt_L", "Alt_R",
+        "Super_L", "Super_R", "Caps_Lock", "Num_Lock",
+        "Scroll_Lock", "Menu", "Pause", "Print",
+        "F1", "F2", "F3", "F4", "F5", "F6",
+        "F7", "F8", "F9", "F10", "F12",
+    }
+
     def __init__(self):
         self._ff = _find("ffmpeg")
         self._fp = _find("ffprobe")
@@ -386,6 +447,7 @@ class Player:
         self._muted = False
         self._speed = 1.0
         self._boss = "Escape"
+        self._boss_any = False
         self._hwm = "auto"
         self._hwd = ""
         self._fsc = False
@@ -403,9 +465,18 @@ class Player:
         self._click_pending = None
         self._drag_gen = 0
         self._drag_busy = False
+        self._drag_was_playing = False
+
+        # subtitle state
+        self._sub_mode = "off"       # "off" | "embed:N" | "ext:/path"
+        self._sub_ext_path = None
+
+        # audio-video sync: wall-clock reference
+        self._sync_wall0 = 0.0
+        self._sync_t0 = 0.0
 
         self._root = TkinterDnD.Tk() if _DND else tk.Tk()
-        self._root.title("Player")
+        self._root.title("PPlayer")
         self._root.geometry("960x600")
         self._root.minsize(480, 320)
         self._root.configure(bg="black")
@@ -445,7 +516,7 @@ class Player:
         key = "hint" if _DND else "hint_nodnd"
         self._cv.show_txt(self._S(key))
 
-    # ━━━━━━━━━━━━━━━━━ Build UI ━━━━━━━━━━━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━━━━━ Build UI ━━━━━━━━━━━━━━━━━
     def _build_ui(self):
         self._mb = tk.Menu(self._root)
         self._root.config(menu=self._mb)
@@ -459,10 +530,12 @@ class Player:
         self._ml = tk.Menu(self._ms, tearoff=0)
         self._mhw = tk.Menu(self._ms, tearoff=0)
         self._mop = tk.Menu(self._ms, tearoff=0)
+        self._msub = tk.Menu(self._mb, tearoff=0)
 
         self._mb.add_cascade(label="File", menu=self._mf)
         self._mb.add_cascade(label="Playback", menu=self._mp)
         self._mb.add_cascade(label="Audio", menu=self._ma)
+        self._mb.add_cascade(label="Subtitle", menu=self._msub)
         self._mb.add_cascade(label="Settings", menu=self._ms)
         self._mb.add_cascade(label="Help", menu=self._mh)
 
@@ -482,7 +555,8 @@ class Player:
 
         self._bar = _Bar(ctrl)
         self._bar.pack(fill="x", padx=4, pady=(4, 0))
-        self._bar.on_seek = self._seek_to
+        self._bar.on_seek = self._on_bar_release
+        self._bar.on_drag_start = self._on_drag_start
         self._bar.on_drag_pos = self._on_drag_preview
         self._bar.on_hover = self._prev_hover
         self._bar.on_leave_cb = self._prev_leave
@@ -553,12 +627,13 @@ class Player:
         self._mb.entryconfigure(1, label=S("file"))
         self._mb.entryconfigure(2, label=S("playback"))
         self._mb.entryconfigure(3, label=S("audio"))
-        self._mb.entryconfigure(4, label=S("settings"))
-        self._mb.entryconfigure(5, label=S("help"))
+        self._mb.entryconfigure(4, label=S("sub"))
+        self._mb.entryconfigure(5, label=S("settings"))
+        self._mb.entryconfigure(6, label=S("help"))
 
         for m in (self._mf, self._mp, self._ma, self._ms,
                   self._mh, self._msp, self._ml, self._mhw,
-                  self._mop):
+                  self._mop, self._msub):
             m.delete(0, "end")
 
         self._mf.add_command(label=S("open"), accelerator="Ctrl+O",
@@ -601,6 +676,20 @@ class Player:
         self._ma.add_command(label=S("mute"), accelerator="M",
                              command=self._toggle_mute)
 
+        # subtitle menu
+        self._msub.add_command(label=S("sub_off"),
+                               command=self._sub_off)
+        self._msub.add_separator()
+        if self._info and self._info.get("subs"):
+            for sub in self._info["subs"]:
+                si = sub["stream_idx"]
+                self._msub.add_command(
+                    label=sub["label"],
+                    command=lambda idx=si: self._sub_embed(idx))
+            self._msub.add_separator()
+        self._msub.add_command(label=S("sub_ext"),
+                               command=self._sub_load_ext)
+
         self._ml.add_command(label="English",
                              command=lambda: self._set_lang("en"))
         self._ml.add_command(label="\u4E2D\u6587",
@@ -608,6 +697,12 @@ class Player:
         self._ms.add_cascade(label=S("lang"), menu=self._ml)
 
         self._ms.add_command(label=S("boss"), command=self._set_boss)
+
+        self._boss_any_var = tk.BooleanVar(value=self._boss_any)
+        self._ms.add_checkbutton(
+            label=S("boss_any"),
+            variable=self._boss_any_var,
+            command=self._toggle_boss_any)
 
         self._mhw.add_command(label=S("hwa"),
                               command=lambda: self._set_hw("auto"))
@@ -648,15 +743,29 @@ class Player:
         r.bind("<period>", lambda e: self._next_frame())
         r.bind("<bracketright>", lambda e: self._cycle_speed(1))
         r.bind("<bracketleft>", lambda e: self._cycle_speed(-1))
+        r.bind("<Key>", self._on_any_key)
         self._bind_boss()
         r.protocol("WM_DELETE_WINDOW", self._quit)
 
     def _bind_boss(self):
-        try:
-            self._root.unbind_all(f"<{self._boss}>")
-        except Exception:
-            pass
-        self._root.bind(f"<{self._boss}>", lambda e: self._quit())
+        pass  # boss key is handled via _on_any_key now
+
+    def _on_any_key(self, event):
+        ks = event.keysym
+        # Boss key (specific key)
+        if ks == self._boss:
+            self._quit()
+            return "break"
+        # Boss any-key mode
+        if self._boss_any and ks not in self._CONTROL_KEYS:
+            # Also skip Ctrl+key combos
+            if not (event.state & 0x4):  # no Control held
+                self._quit()
+                return "break"
+        return None
+
+    def _toggle_boss_any(self):
+        self._boss_any = self._boss_any_var.get()
 
     # ━━━━━━━━━━━━━━━ Language ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _set_lang(self, c):
@@ -727,6 +836,60 @@ class Player:
         if res[0]:
             self._open_video(res[0])
 
+    # ━━━━━━━━━━━━━ Subtitle ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    def _sub_off(self):
+        changed = self._sub_mode != "off"
+        self._sub_mode = "off"
+        self._sub_ext_path = None
+        if changed and self._playing:
+            t = self._ct
+            self._kill()
+            self._start(t)
+
+    def _sub_embed(self, stream_idx):
+        new_mode = f"embed:{stream_idx}"
+        changed = self._sub_mode != new_mode
+        self._sub_mode = new_mode
+        self._sub_ext_path = None
+        if changed and self._playing:
+            t = self._ct
+            self._kill()
+            self._start(t)
+        elif changed and self._paused:
+            self._grab_frame(self._ct)
+
+    def _sub_load_ext(self):
+        ft = [("Subtitle",
+               "*.srt *.ass *.ssa *.sub *.vtt *.idx *.sup"),
+              ("All", "*.*")]
+        p = filedialog.askopenfilename(filetypes=ft)
+        if p:
+            self._sub_mode = "ext"
+            self._sub_ext_path = p
+            if self._playing:
+                t = self._ct
+                self._kill()
+                self._start(t)
+            elif self._paused:
+                self._grab_frame(self._ct)
+
+    def _build_vf_filter(self):
+        """Build -vf string for subtitles."""
+        parts = []
+        if self._sub_mode.startswith("embed:"):
+            idx = int(self._sub_mode.split(":")[1])
+            # Use subtitles filter with stream index
+            if self._path:
+                safe = self._path.replace("\\", "/").replace(":", "\\\\:")
+                safe = safe.replace("'", "\\'").replace("[", "\\[").replace("]", "\\]")
+                parts.append(f"subtitles='{safe}':si={idx}")
+        elif self._sub_mode == "ext" and self._sub_ext_path:
+            safe = self._sub_ext_path.replace("\\", "/").replace(":", "\\\\:")
+            safe = safe.replace("'", "\\'").replace("[", "\\[").replace("]", "\\]")
+            parts.append(f"subtitles='{safe}'")
+        parts.append(f"scale={self._dw}:{self._dh}")
+        return ",".join(parts)
+
     # ━━━━━━━━━━━━━ Open Video ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _open_video(self, path):
         self._do_close()
@@ -742,6 +905,8 @@ class Player:
         self._bar.dur = info["duration"]
         self._bar.set_pos(0)
         self._pcache.clear()
+        self._sub_mode = "off"
+        self._sub_ext_path = None
 
         w, h = info["width"], info["height"]
         if h > 1080:
@@ -752,6 +917,7 @@ class Player:
 
         self._root.title(
             f"{os.path.basename(path)} — {self._S('title')}")
+        self._build_menus()
         self._start(0.0)
 
     # ━━━━━━━━━━━━━━━━ Playback Engine ━━━━━━━━━━━━━━━━━
@@ -763,6 +929,7 @@ class Player:
         self._paused = False
         self._ct = t
         self._hwd = ""
+        self._lhw.config(text="")
 
         while not self._q.empty():
             try:
@@ -777,16 +944,20 @@ class Player:
             cmd += ["-hwaccel", self._hwm]
         if t > 0.5:
             cmd += ["-ss", f"{t:.3f}"]
-        cmd += ["-i", self._path,
-                "-f", "rawvideo", "-pix_fmt", "rgb24",
-                "-s", f"{self._dw}x{self._dh}",
+        cmd += ["-i", self._path]
+
+        # video filter (subtitle burn-in + scale)
+        vf = self._build_vf_filter()
+        cmd += ["-vf", vf]
+
+        cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-an", "-sn",
-                "-v", "info", "pipe:1"]
+                "-v", "error", "pipe:1"]
         try:
             self._vp = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 bufsize=self._dw * self._dh * 3 * 2,
                 **_pkw())
         except Exception as exc:
@@ -797,9 +968,13 @@ class Player:
         if self._info["has_audio"] and self._fy and not self._muted:
             self._start_audio(t)
 
+        # sync reference: audio and video both start "now" from time t
+        self._sync_t0 = t
+        self._sync_wall0 = time.monotonic()
+
         threading.Thread(target=self._vloop, args=(gen,),
                          daemon=True).start()
-        threading.Thread(target=self._sloop, args=(gen,),
+        threading.Thread(target=self._detect_hw_thread, args=(gen,),
                          daemon=True).start()
 
         self._bpp.config(text="\u23F8")
@@ -862,10 +1037,6 @@ class Player:
                 p.stdout.close()
             except Exception:
                 pass
-            try:
-                p.stderr.close()
-            except Exception:
-                pass
         while not self._q.empty():
             try:
                 self._q.get_nowait()
@@ -880,9 +1051,12 @@ class Player:
         fsz = self._dw * self._dh * 3
         fps = self._info["fps"]
         spf = 1.0 / fps
-        dspf = spf / max(0.1, self._speed)
-        t0 = self._ct
-        w0 = time.monotonic()
+        speed = max(0.1, self._speed)
+        dspf = spf / speed      # wall-clock duration per frame at speed
+
+        # Use wall-clock sync: both audio and video start at same wall0/t0
+        t0 = self._sync_t0
+        wall0 = self._sync_wall0
         n = 0
         try:
             while self._gen == gen and not self._evt.is_set():
@@ -890,14 +1064,24 @@ class Player:
                 if raw is None or self._gen != gen:
                     break
                 n += 1
-                self._ct = t0 + n * spf
+                frame_time = t0 + n * spf
+                self._ct = frame_time
 
-                tgt = w0 + n * dspf
-                dt = tgt - time.monotonic()
+                # Target wall-clock time for this frame
+                tgt_wall = wall0 + n * dspf
+                now = time.monotonic()
+                dt = tgt_wall - now
+
                 if dt > 0.002:
+                    # ahead of schedule — sleep to sync with audio
                     time.sleep(dt)
-                elif dt < -dspf * 10:
-                    w0 = time.monotonic() - n * dspf
+                elif dt < -0.1:
+                    # way behind — skip display but keep reading
+                    # to catch up (don't push to queue)
+                    if dt < -dspf * 5:
+                        # too far behind, reset reference
+                        wall0 = time.monotonic() - n * dspf
+                    continue
 
                 try:
                     self._q.put_nowait(raw)
@@ -916,60 +1100,81 @@ class Player:
             self._playing = False
             self._root.after(0, self._on_eof)
 
-    # ── stderr reader thread (detect hw accel name) ────
-    def _sloop(self, gen):
-        proc = self._vp
-        if not proc or not proc.stderr:
+    # ── hardware accel detection thread ────────────────
+    def _detect_hw_thread(self, gen):
+        if self._hwm == "off":
+            if self._gen == gen:
+                self._root.after(0, lambda: self._lhw.config(
+                    text=self._S("stag"), fg="#aa6"))
             return
-        found_hw = False
-        all_text = []
+
+        cmd = [self._ff, "-v", "verbose"]
+        if self._hwm == "auto":
+            cmd += ["-hwaccel", "auto"]
+        else:
+            cmd += ["-hwaccel", self._hwm]
+        cmd += ["-i", self._path,
+                "-frames:v", "1", "-f", "null",
+                "-an", "-sn", "-"]
+
         try:
-            while self._gen == gen and not self._evt.is_set():
-                raw_line = proc.stderr.readline()
-                if not raw_line:
-                    break
-                txt = raw_line.decode("utf-8", errors="ignore")
-                all_text.append(txt)
-                if found_hw:
-                    continue
-                # Try to detect the specific hwaccel decoder being used
-                # e.g. "decoder: h264_cuvid" or "Using auto hwaccel type d3d11va"
-                for pat in [
-                    r"decoder\s*[:\s]\s*(\w+_cuvid|\w+_qsv|\w+_nvdec|\w+_amf|\w+_vaapi|\w+_vdpau|\w+_videotoolbox|\w+_mediacodec|\w+_mf|\w+_d3d11va|\w+_dxva2)",
-                    r"using\s+(\w+)\s+hwaccel",
-                    r"hwaccel\s+type\s+(\w+)",
-                    r"device\s+type\s+(\w+)",
-                    r"Using\s+hwaccel\s+(\w+)",
-                    r"HW\s+accel[:\s]+(\w+)",
-                    r"hw[/_]?accel[:\s]+(\w+)",
-                ]:
-                    m = re.search(pat, txt, re.I)
-                    if m:
-                        self._hwd = m.group(1)
-                        found_hw = True
-                        self._root.after(0, self._upd_hw)
-                        break
+            r = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                **_pkw())
+            txt = r.stderr.decode("utf-8", errors="ignore")
         except Exception:
-            pass
-        # If no pattern matched yet, do a second pass on accumulated text
-        if self._gen == gen and not found_hw:
-            full = "".join(all_text)
-            # Look for hwaccel type mentions in full output
-            for pat in [
-                r"using\s+(\w+)\s+hwaccel",
-                r"hwaccel\s+type\s+(\w+)",
-                r"device\s+type[:\s]+(\w+)",
-                r"HW\s+decoder[:\s]+(\w+)",
-                r"(d3d11va|dxva2|cuda|nvdec|cuvid|qsv|vaapi|vdpau|videotoolbox|mediacodec|vulkan|opencl)",
-            ]:
-                m = re.search(pat, full, re.I)
-                if m:
-                    self._hwd = m.group(1)
-                    found_hw = True
-                    self._root.after(0, self._upd_hw)
+            txt = ""
+
+        if self._gen != gen:
+            return
+
+        hw_name = None
+
+        for pat in [
+            r"Using\s+auto\s+hwaccel\s+type\s+(\w+)",
+            r"Using\s+(\w+)\s+hwaccel",
+            r"hwaccel\s+type\s+(\w+)",
+            r"HW\s+accel[:\s]+(\w+)",
+            r"device\s+type[:\s]+(\w+)",
+        ]:
+            m = re.search(pat, txt, re.I)
+            if m:
+                val = m.group(1)
+                if val.lower() not in ("auto", "type", "with", "new"):
+                    hw_name = val
                     break
-        if self._gen == gen and not found_hw:
-            self._root.after(0, self._upd_hw_sw)
+
+        if not hw_name:
+            m = re.search(
+                r"(\w+(?:_cuvid|_qsv|_nvdec|_amf|_vaapi|_vdpau"
+                r"|_videotoolbox|_mediacodec|_d3d11va|_dxva2))",
+                txt, re.I)
+            if m:
+                hw_name = m.group(1)
+
+        if not hw_name:
+            m = re.search(
+                r"\b(d3d11va|dxva2|cuda|nvdec|cuvid|qsv|vaapi|vdpau"
+                r"|videotoolbox|mediacodec|vulkan)\b",
+                txt, re.I)
+            if m:
+                hw_name = m.group(1)
+
+        if not hw_name and self._hwm not in ("auto", "off"):
+            check = self._hwm.lower()
+            if check in txt.lower():
+                hw_name = self._hwm
+
+        if hw_name and self._gen == gen:
+            self._hwd = hw_name
+            self._root.after(0, lambda: self._lhw.config(
+                text=self._S("htag").format(hw_name), fg="#6a6"))
+        elif self._gen == gen:
+            self._root.after(0, lambda: self._lhw.config(
+                text=self._S("stag"), fg="#aa6"))
 
     def _on_eof(self):
         self._bpp.config(text="\u25B6")
@@ -977,34 +1182,33 @@ class Player:
 
     # ── display tick (main thread, ~66 Hz) ─────────────
     def _tick(self):
-        latest = None
-        try:
-            while True:
-                latest = self._q.get_nowait()
-        except queue.Empty:
-            pass
-        if latest is not None:
+        if self._playing:
+            latest = None
             try:
-                img = Image.frombytes("RGB", (self._dw, self._dh), latest)
-                self._frame = img
-                self._cv.show_img(img)
-            except Exception:
+                while True:
+                    latest = self._q.get_nowait()
+            except queue.Empty:
                 pass
-        if self._playing and self._info:
+            if latest is not None:
+                try:
+                    img = Image.frombytes("RGB", (self._dw, self._dh),
+                                          latest)
+                    self._frame = img
+                    self._cv.show_img(img)
+                except Exception:
+                    pass
             self._bar.set_pos(self._ct)
             self._tv.set(
                 f"{self._fmt(self._ct)} / "
                 f"{self._fmt(self._info['duration'])}")
+        else:
+            # drain any stale frames
+            try:
+                while True:
+                    self._q.get_nowait()
+            except queue.Empty:
+                pass
         self._root.after(15, self._tick)
-
-    def _upd_hw(self):
-        if self._hwd:
-            self._lhw.config(
-                text=self._S("htag").format(self._hwd), fg="#6a6")
-
-    def _upd_hw_sw(self):
-        if self._playing and not self._hwd:
-            self._lhw.config(text=self._S("stag"), fg="#aa6")
 
     # ━━━━━━━━━━━━━━ Playback Controls ━━━━━━━━━━━━━━━━━
     def _toggle_play(self):
@@ -1044,8 +1248,68 @@ class Player:
         self._bpp.config(text="\u25B6")
         self._lhw.config(text="")
         self._tv.set("00:00 / 00:00")
+        self._sub_mode = "off"
+        self._sub_ext_path = None
         self._root.title(self._S("title"))
         self._show_hint()
+
+    # ── drag: start / move / release ───────────────────
+    def _on_drag_start(self):
+        self._drag_was_playing = self._playing
+        if self._playing:
+            self._kill()
+        self._bpp.config(text="\u25B6")
+
+    def _on_drag_preview(self, t):
+        if not self._path or not self._info:
+            return
+        self._ct = t
+        self._bar.pos = t
+        self._bar._draw()
+        self._tv.set(
+            f"{self._fmt(t)} / {self._fmt(self._info['duration'])}")
+        self._drag_gen += 1
+        dg = self._drag_gen
+        if self._drag_busy:
+            return
+        self._drag_busy = True
+        dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
+
+        def job():
+            cmd = [ff, "-ss", f"{t:.3f}",
+                   "-i", path,
+                   "-vframes", "1", "-f", "rawvideo",
+                   "-pix_fmt", "rgb24",
+                   "-s", f"{dw}x{dh}",
+                   "-v", "quiet", "pipe:1"]
+            data = _run_bin(cmd, timeout=3)
+            need = dw * dh * 3
+            if len(data) >= need:
+                img = Image.frombytes("RGB", (dw, dh), data[:need])
+                self._frame = img
+                self._root.after(0, lambda: self._cv.show_img(img))
+            self._drag_busy = False
+            if self._drag_gen != dg and self._bar._drag:
+                newest_t = self._bar.pos
+                self._root.after(
+                    0, lambda: self._on_drag_preview(newest_t))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _on_bar_release(self, t):
+        was = self._drag_was_playing
+        self._drag_was_playing = False
+        self._ct = max(0.0, t)
+        if was:
+            self._start(self._ct)
+        else:
+            self._paused = True
+            self._bar.set_pos(self._ct)
+            if self._info:
+                self._tv.set(
+                    f"{self._fmt(self._ct)} / "
+                    f"{self._fmt(self._info['duration'])}")
+            self._grab_frame(self._ct)
 
     def _seek_to(self, t):
         if not self._path:
@@ -1070,52 +1334,16 @@ class Player:
         t = max(0.0, min(self._info["duration"], self._ct + dt))
         self._seek_to(t)
 
-    # ── drag preview: show frame at dragged position in real time ──
-    def _on_drag_preview(self, t):
-        """Called continuously while user drags the progress bar."""
-        if not self._path or not self._info:
-            return
-        self._ct = t
-        self._bar.set_pos(t)
-        self._tv.set(
-            f"{self._fmt(t)} / {self._fmt(self._info['duration'])}")
-        # Throttled frame grab — skip if a previous one is still running
-        self._drag_gen += 1
-        dg = self._drag_gen
-        if self._drag_busy:
-            return
-        self._drag_busy = True
-        dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
-
-        def job():
-            cmd = [ff, "-ss", f"{t:.3f}",
-                   "-i", path,
-                   "-vframes", "1", "-f", "rawvideo",
-                   "-pix_fmt", "rgb24",
-                   "-s", f"{dw}x{dh}",
-                   "-v", "quiet", "pipe:1"]
-            data = _run_bin(cmd, timeout=3)
-            need = dw * dh * 3
-            if len(data) >= need and self._drag_gen == dg:
-                img = Image.frombytes("RGB", (dw, dh), data[:need])
-                self._frame = img
-                self._root.after(0, lambda: self._cv.show_img(img))
-            self._drag_busy = False
-            # If user moved further while we were busy, fire one more
-            if self._drag_gen != dg and self._bar._drag:
-                self._root.after(0, lambda: self._on_drag_preview(self._bar.pos))
-
-        threading.Thread(target=job, daemon=True).start()
-
     def _grab_frame(self, t):
         dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
+        vf = self._build_vf_filter()
 
         def job():
             cmd = [ff, "-ss", f"{t:.3f}",
                    "-i", path,
+                   "-vf", vf,
                    "-vframes", "1", "-f", "rawvideo",
                    "-pix_fmt", "rgb24",
-                   "-s", f"{dw}x{dh}",
                    "-v", "quiet", "pipe:1"]
             data = _run_bin(cmd, timeout=5)
             need = dw * dh * 3
@@ -1165,7 +1393,8 @@ class Player:
             self._lvl.config(text=f"{self._vol}%")
         if hasattr(self, "_bmu"):
             self._mu_icon()
-        if self._ui_ready and self._playing and self._info and self._info["has_audio"]:
+        if (self._ui_ready and self._playing
+                and self._info and self._info["has_audio"]):
             self._start_audio(self._ct)
 
     def _chg_vol(self, d):
@@ -1246,9 +1475,7 @@ class Player:
     def _prev_leave(self):
         self._tip.hide()
 
-    # ━━━━━━━━━━━━━━ Global tooltip cleanup ━━━━━━━━━━━━
     def _check_tip_hide(self):
-        """Periodically check if mouse is still over the progress bar; hide tooltip if not."""
         try:
             mx = self._root.winfo_pointerx()
             my = self._root.winfo_pointery()
@@ -1276,13 +1503,7 @@ class Player:
                  justify="center").pack(expand=True, padx=10, pady=10)
 
         def on_key(e):
-            old = self._boss
             self._boss = e.keysym
-            try:
-                self._root.unbind(f"<{old}>")
-            except Exception:
-                pass
-            self._bind_boss()
             dlg.destroy()
 
         dlg.bind("<Key>", on_key)
@@ -1299,12 +1520,20 @@ class Player:
     def _about(self):
         dlg = tk.Toplevel(self._root)
         dlg.title(self._S("about"))
-        dlg.geometry("400x220")
+        dlg.geometry("480x340")
         dlg.transient(self._root)
         dlg.resizable(False, False)
 
+        ver_line = "unknown"
+        try:
+            ver_raw = _run_text([self._ff, "-version"], timeout=5)
+            if ver_raw:
+                ver_line = ver_raw.strip().split("\n")[0]
+        except Exception:
+            pass
+
         txt = self._S("abt")
-        txt += f"\n\nFFmpeg: {self._ff}"
+        txt += f"\n\n{ver_line}"
         if self._fp:
             txt += f"\nffprobe: {self._fp}"
         if self._fy:
@@ -1313,7 +1542,7 @@ class Player:
             txt += "\nffplay: (not found — no audio)"
 
         tk.Label(dlg, text=txt, font=("Helvetica", 10),
-                 justify="center", wraplength=380).pack(
+                 justify="center", wraplength=460).pack(
             expand=True, padx=10)
         tk.Button(dlg, text=self._S("ok"), width=10,
                   command=dlg.destroy).pack(pady=8)
