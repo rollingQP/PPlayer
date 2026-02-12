@@ -1063,15 +1063,26 @@ class Player:
         if self._sub_mode.startswith("embed:"):
             idx = int(self._sub_mode.split(":")[1])
             if self._path:
-                safe = self._path.replace("\\", "/").replace(":", "\\\\:")
-                safe = safe.replace("'", "\\'").replace("[", "\\[").replace("]", "\\]")
+                # 1. 将反斜杠替换为正斜杠，避免转义歧义
+                safe = self._path.replace("\\", "/")
+                # 2. 关键修复：在 Windows 上，必须转义驱动器后的冒号 (C: -> C\:)
+                #    注意这里只用一个反斜杠转义 (Python字符串写作 "\\:")
+                safe = safe.replace(":", "\\:")
+                # 3. 转义文件名内部的单引号
+                safe = safe.replace("'", "\\'")
+                # 注意：不要转义 [ 或 ]，也不要使用双重反斜杠转义冒号
+                
                 parts.append(f"subtitles='{safe}':si={idx}")
         elif self._sub_mode == "ext" and self._sub_ext_path:
-            safe = self._sub_ext_path.replace("\\", "/").replace(":", "\\\\:")
-            safe = safe.replace("'", "\\'").replace("[", "\\[").replace("]", "\\]")
+            safe = self._sub_ext_path.replace("\\", "/")
+            safe = safe.replace(":", "\\:")
+            safe = safe.replace("'", "\\'")
             parts.append(f"subtitles='{safe}'")
+            
         parts.append(f"scale={self._dw}:{self._dh}")
         return ",".join(parts)
+
+
 
     # ━━━━━━━━━━━━━ Open Video ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _open_video(self, path):
@@ -1126,8 +1137,14 @@ class Player:
             cmd += ["-hwaccel", "auto"]
         elif self._hwm != "off":
             cmd += ["-hwaccel", self._hwm]
+        
         if t > 0.5:
             cmd += ["-ss", f"{t:.3f}"]
+
+        # 【修复关键点】：添加 -copyts 参数
+        # 这保留了原始时间戳，确保字幕滤镜能正确匹配视频帧
+        cmd += ["-copyts"]
+
         cmd += ["-i", self._path]
 
         vf = self._build_vf_filter()
