@@ -29,6 +29,13 @@ try:
 except AttributeError:
     _BIL = Image.BILINEAR
 
+# ── Config paths ────────────────────────────────────────────
+if _W:
+    _CFG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "PPlayer"
+else:
+    _CFG_DIR = Path.home() / ".pplayer"
+_CFG_FILE = _CFG_DIR / "settings.json"
+
 # ━━━━━━━━━━━━━━━━━━━ i18n ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _L = {
     "en": {
@@ -171,11 +178,8 @@ def _pkw():
 def _run_text(cmd, timeout=15):
     try:
         r = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            **_pkw())
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, **_pkw())
         return r.stdout.decode("utf-8", errors="ignore")
     except Exception:
         return ""
@@ -184,11 +188,8 @@ def _run_text(cmd, timeout=15):
 def _run_bin(cmd, timeout=5):
     try:
         r = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            **_pkw())
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, **_pkw())
         return r.stdout
     except Exception:
         return b""
@@ -197,15 +198,13 @@ def _run_bin(cmd, timeout=5):
 def _probe(ffprobe, path):
     txt = _run_text(
         [ffprobe, "-v", "quiet", "-print_format", "json",
-         "-show_format", "-show_streams", path],
-        timeout=15)
+         "-show_format", "-show_streams", path], timeout=15)
     if not txt:
         return None
     try:
         d = json.loads(txt)
     except json.JSONDecodeError:
         return None
-
     info = dict(duration=0.0, width=0, height=0, fps=30.0,
                 has_audio=False, vcodec="", subs=[])
     info["duration"] = float(d.get("format", {}).get("duration", 0))
@@ -262,6 +261,142 @@ def _read_n(pipe, n):
             return None
         buf += ch
     return buf
+
+
+# ━━━━━━━━━━━━━━━ Audio Player (master clock) ━━━━━━━━━━━━━━━
+class _AudioPlayer:
+    """Wraps ffplay; reads stderr in real-time to track audio position."""
+
+    def __init__(self):
+        self._proc = None
+        self._pos = 0.0
+        self._pos_wall = 0.0
+        self._seek_time = 0.0
+        self._speed = 1.0
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        self._alive = False
+
+    # ── public API ──────────────────────────────────────
+    def start(self, ffplay_path, file_path, seek_time, volume, speed):
+        self.stop()
+        self._speed = max(0.1, speed)
+        self._seek_time = seek_time
+        with self._lock:
+            self._pos = seek_time
+            self._pos_wall = time.monotonic()
+        self._ready.clear()
+        self._alive = True
+
+        cmd = [ffplay_path, "-nodisp", "-autoexit", "-vn",
+               "-loglevel", "info"]
+        if seek_time > 0.5:
+            cmd += ["-ss", f"{seek_time:.3f}"]
+        cmd += ["-volume", str(volume)]
+        if abs(speed - 1.0) > 0.01:
+            parts = []
+            v = speed
+            while v > 2.0:
+                parts.append("atempo=2.0")
+                v /= 2.0
+            while v < 0.5:
+                parts.append("atempo=0.5")
+                v *= 2.0
+            parts.append(f"atempo={v:.4f}")
+            cmd += ["-af", ",".join(parts)]
+        cmd += ["-i", file_path]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                **_pkw())
+        except Exception:
+            self._alive = False
+            return
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def stop(self):
+        self._alive = False
+        self._ready.clear()
+        proc = self._proc
+        self._proc = None
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def wait_ready(self, timeout=5.0):
+        return self._ready.wait(timeout)
+
+    @property
+    def is_ready(self):
+        return self._ready.is_set()
+
+    @property
+    def is_alive(self):
+        return (self._alive and self._proc is not None
+                and self._proc.poll() is None)
+
+    @property
+    def media_position(self):
+        """Estimated current media-time (interpolated between reports)."""
+        with self._lock:
+            if not self._ready.is_set():
+                return self._seek_time
+            elapsed = time.monotonic() - self._pos_wall
+            # ffplay output-time advances at 1× real-time even with atempo
+            interp = self._pos + elapsed
+            if abs(self._speed - 1.0) < 0.01:
+                return interp
+            # convert output-time → media-time for non-1× speed
+            return self._seek_time + (interp - self._seek_time) * self._speed
+
+    # ── internal ────────────────────────────────────────
+    def _reader(self):
+        proc = self._proc
+        if not proc:
+            return
+        buf = b""
+        try:
+            while proc.poll() is None:
+                ch = proc.stderr.read(1)
+                if not ch:
+                    break
+                if ch in (b'\r', b'\n'):
+                    if buf:
+                        self._parse(buf.decode("utf-8", errors="ignore"))
+                        buf = b""
+                else:
+                    buf += ch
+                    if len(buf) > 1024:
+                        buf = b""
+        except (OSError, ValueError):
+            pass
+        self._alive = False
+
+    _RE_STATUS = re.compile(r'([\d]+\.[\d]+).*?fd=')
+
+    def _parse(self, line):
+        m = self._RE_STATUS.search(line)
+        if m:
+            try:
+                pos = float(m.group(1))
+                with self._lock:
+                    self._pos = pos
+                    self._pos_wall = time.monotonic()
+                if not self._ready.is_set():
+                    self._ready.set()
+            except ValueError:
+                pass
 
 
 # ━━━━━━━━━━━━━━━ Widgets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -419,7 +554,6 @@ class _Tip:
 class Player:
     SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-    # Keys that have control functions — NOT triggering boss-any-key exit
     _CONTROL_KEYS = {
         "space", "Left", "Right", "Up", "Down",
         "m", "M", "f", "F", "F11", "period",
@@ -437,25 +571,29 @@ class Player:
         self._fp = _find("ffprobe")
         self._fy = _find("ffplay")
 
-        self._lang = "en"
+        # ── load persisted settings ─────────────────────
+        cfg = self._load_settings()
+        self._lang = cfg["lang"]
+        self._vol = cfg["volume"]
+        self._speed = cfg["speed"]
+        self._hwm = cfg["hw_mode"]
+        self._boss = cfg["boss_key"]
+        self._boss_any = cfg["boss_any"]
+        self._opacity = cfg["opacity"]
+        self._saved_geo = cfg["geometry"]
+
         self._path = None
         self._info = None
         self._playing = False
         self._paused = False
         self._ct = 0.0
-        self._vol = 100
         self._muted = False
-        self._speed = 1.0
-        self._boss = "Escape"
-        self._boss_any = False
-        self._hwm = "auto"
-        self._hwd = ""
         self._fsc = False
         self._gen = 0
         self._evt = threading.Event()
         self._q = queue.Queue(maxsize=8)
         self._vp = None
-        self._ap = None
+        self._audio = _AudioPlayer()
         self._frame = None
         self._dw = 0
         self._dh = 0
@@ -466,20 +604,19 @@ class Player:
         self._drag_gen = 0
         self._drag_busy = False
         self._drag_was_playing = False
-
-        # subtitle state
-        self._sub_mode = "off"       # "off" | "embed:N" | "ext:/path"
-        self._sub_ext_path = None
-
-        # audio-video sync: wall-clock reference
-        self._sync_wall0 = 0.0
+        self._vol_timer = None
+        self._hwd = ""
         self._sync_t0 = 0.0
+
+        self._sub_mode = "off"
+        self._sub_ext_path = None
 
         self._root = TkinterDnD.Tk() if _DND else tk.Tk()
         self._root.title("PPlayer")
-        self._root.geometry("960x600")
+        self._root.geometry(self._saved_geo)
         self._root.minsize(480, 320)
         self._root.configure(bg="black")
+        self._root.attributes("-alpha", self._opacity)
 
         if not self._ff:
             self._root.withdraw()
@@ -492,6 +629,11 @@ class Player:
         self._build_menus()
         self._bind_keys()
 
+        # apply loaded settings to UI widgets
+        self._vsc.set(self._vol)
+        self._lsp.config(text=f"{self._speed}x")
+        self._mu_icon()
+
         if _DND:
             self._root.drop_target_register(DND_FILES)
             self._root.dnd_bind("<<Drop>>", self._on_drop)
@@ -502,6 +644,7 @@ class Player:
     def run(self):
         self._root.mainloop()
 
+    # ── i18n helper ─────────────────────────────────────
     def _S(self, k):
         return _L.get(self._lang, _L["en"]).get(k, k)
 
@@ -516,7 +659,52 @@ class Player:
         key = "hint" if _DND else "hint_nodnd"
         self._cv.show_txt(self._S(key))
 
-    # ━━━━━━━━━━━━━━━━━ Build UI ━━━━━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━ Settings persistence ━━━━━━━━━━━━━━━━
+    def _load_settings(self):
+        defaults = dict(lang="en", volume=100, speed=1.0,
+                        hw_mode="auto", boss_key="Escape",
+                        boss_any=False, opacity=1.0,
+                        geometry="960x600")
+        try:
+            if _CFG_FILE.exists():
+                with open(_CFG_FILE, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                for k in defaults:
+                    if k in d:
+                        defaults[k] = d[k]
+        except Exception:
+            pass
+        # validate
+        if defaults["lang"] not in _L:
+            defaults["lang"] = "en"
+        defaults["volume"] = max(0, min(100, int(defaults["volume"])))
+        if defaults["speed"] not in Player.SPEEDS:
+            defaults["speed"] = 1.0
+        defaults["opacity"] = max(0.3, min(1.0, float(defaults["opacity"])))
+        if not isinstance(defaults["boss_any"], bool):
+            defaults["boss_any"] = False
+        if not isinstance(defaults["geometry"], str):
+            defaults["geometry"] = "960x600"
+        return defaults
+
+    def _save_settings(self):
+        try:
+            _CFG_DIR.mkdir(parents=True, exist_ok=True)
+            geo = "960x600"
+            try:
+                geo = self._root.geometry()
+            except Exception:
+                pass
+            d = dict(lang=self._lang, volume=self._vol,
+                     speed=self._speed, hw_mode=self._hwm,
+                     boss_key=self._boss, boss_any=self._boss_any,
+                     opacity=self._opacity, geometry=geo)
+            with open(_CFG_FILE, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # ━━━━━━━━━━━━━━━━━ Build UI ━━━━━━━━━━━━━━━━━━━━━━━━
     def _build_ui(self):
         self._mb = tk.Menu(self._root)
         self._root.config(menu=self._mb)
@@ -716,10 +904,14 @@ class Player:
         for p in (100, 90, 80, 70, 60, 50, 40, 30):
             self._mop.add_command(
                 label=f"{p}%",
-                command=lambda v=p: self._root.attributes("-alpha", v / 100))
+                command=lambda v=p: self._set_opacity(v))
         self._ms.add_cascade(label=S("opa"), menu=self._mop)
 
         self._mh.add_command(label=S("about"), command=self._about)
+
+    def _set_opacity(self, pct):
+        self._opacity = max(0.3, min(1.0, pct / 100.0))
+        self._root.attributes("-alpha", self._opacity)
 
     # ━━━━━━━━━━━━━━━ Key Bindings ━━━━━━━━━━━━━━━━━━━━━
     def _bind_keys(self):
@@ -744,22 +936,15 @@ class Player:
         r.bind("<bracketright>", lambda e: self._cycle_speed(1))
         r.bind("<bracketleft>", lambda e: self._cycle_speed(-1))
         r.bind("<Key>", self._on_any_key)
-        self._bind_boss()
         r.protocol("WM_DELETE_WINDOW", self._quit)
-
-    def _bind_boss(self):
-        pass  # boss key is handled via _on_any_key now
 
     def _on_any_key(self, event):
         ks = event.keysym
-        # Boss key (specific key)
         if ks == self._boss:
             self._quit()
             return "break"
-        # Boss any-key mode
         if self._boss_any and ks not in self._CONTROL_KEYS:
-            # Also skip Ctrl+key combos
-            if not (event.state & 0x4):  # no Control held
+            if not (event.state & 0x4):
                 self._quit()
                 return "break"
         return None
@@ -874,11 +1059,9 @@ class Player:
                 self._grab_frame(self._ct)
 
     def _build_vf_filter(self):
-        """Build -vf string for subtitles."""
         parts = []
         if self._sub_mode.startswith("embed:"):
             idx = int(self._sub_mode.split(":")[1])
-            # Use subtitles filter with stream index
             if self._path:
                 safe = self._path.replace("\\", "/").replace(":", "\\\\:")
                 safe = safe.replace("'", "\\'").replace("[", "\\[").replace("]", "\\]")
@@ -937,6 +1120,7 @@ class Player:
             except queue.Empty:
                 break
 
+        # ── video process ───────────────────────────────
         cmd = [self._ff]
         if self._hwm == "auto":
             cmd += ["-hwaccel", "auto"]
@@ -946,18 +1130,14 @@ class Player:
             cmd += ["-ss", f"{t:.3f}"]
         cmd += ["-i", self._path]
 
-        # video filter (subtitle burn-in + scale)
         vf = self._build_vf_filter()
         cmd += ["-vf", vf]
-
         cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-an", "-sn",
                 "-v", "error", "pipe:1"]
         try:
             self._vp = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 bufsize=self._dw * self._dh * 3 * 2,
                 **_pkw())
         except Exception as exc:
@@ -965,67 +1145,23 @@ class Player:
             self._playing = False
             return
 
+        # ── audio process (master clock) ────────────────
         if self._info["has_audio"] and self._fy and not self._muted:
-            self._start_audio(t)
+            self._audio.start(self._fy, self._path,
+                              t, self._vol, self._speed)
 
-        # sync reference: audio and video both start "now" from time t
         self._sync_t0 = t
-        self._sync_wall0 = time.monotonic()
 
         threading.Thread(target=self._vloop, args=(gen,),
                          daemon=True).start()
         threading.Thread(target=self._detect_hw_thread, args=(gen,),
                          daemon=True).start()
-
         self._bpp.config(text="\u23F8")
-
-    def _start_audio(self, t):
-        self._stop_audio()
-        cmd = [self._fy, "-nodisp", "-autoexit", "-loglevel", "quiet"]
-        if t > 0.5:
-            cmd += ["-ss", f"{t:.3f}"]
-        cmd += ["-volume", str(self._vol)]
-        if abs(self._speed - 1.0) > 0.01:
-            parts = []
-            v = self._speed
-            while v > 2.0:
-                parts.append("atempo=2.0")
-                v /= 2.0
-            while v < 0.5:
-                parts.append("atempo=0.5")
-                v /= 0.5
-            parts.append(f"atempo={v:.4f}")
-            cmd += ["-af", ",".join(parts)]
-        cmd += ["-i", self._path]
-        try:
-            self._ap = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **_pkw())
-        except Exception:
-            self._ap = None
-
-    def _stop_audio(self):
-        if self._ap:
-            try:
-                self._ap.terminate()
-            except Exception:
-                pass
-            try:
-                self._ap.wait(timeout=2)
-            except Exception:
-                try:
-                    self._ap.kill()
-                except Exception:
-                    pass
-            self._ap = None
 
     def _kill(self):
         self._evt.set()
         self._playing = False
-        self._stop_audio()
+        self._audio.stop()
         p = self._vp
         if p:
             self._vp = None
@@ -1043,7 +1179,7 @@ class Player:
             except queue.Empty:
                 break
 
-    # ── video reader thread ────────────────────────────
+    # ── video reader thread (syncs to audio clock) ─────
     def _vloop(self, gen):
         proc = self._vp
         if not proc:
@@ -1052,39 +1188,77 @@ class Player:
         fps = self._info["fps"]
         spf = 1.0 / fps
         speed = max(0.1, self._speed)
-        dspf = spf / speed
+        dspf = spf / speed            # wall-seconds per frame
 
         t0 = self._sync_t0
-        wall0 = self._sync_wall0
+        has_audio = (self._info["has_audio"] and not self._muted
+                     and self._fy is not None)
+
+        # give audio time to start
+        if has_audio:
+            self._audio.wait_ready(timeout=3.0)
+
+        wall0 = time.monotonic()
         n = 0
-        synced = False
+        first_frame = True
+
         try:
             while self._gen == gen and not self._evt.is_set():
                 raw = _read_n(proc.stdout, fsz)
                 if raw is None or self._gen != gen:
                     break
-                n += 1
-
-                if not synced:
-                    synced = True
-                    wall0 = time.monotonic()
-                    self._sync_wall0 = wall0
-                    n = 1
 
                 frame_time = t0 + n * spf
                 self._ct = frame_time
 
-                tgt_wall = wall0 + n * dspf
-                now = time.monotonic()
-                dt = tgt_wall - now
+                if first_frame:
+                    first_frame = False
+                    wall0 = time.monotonic()
 
-                if dt > 0.002:
-                    time.sleep(dt)
-                elif dt < -0.1:
-                    if dt < -dspf * 5:
-                        wall0 = time.monotonic() - n * dspf
-                    continue
+                # ── choose sync source for this frame ───
+                a = self._audio
+                use_audio = (has_audio and a.is_ready
+                             and a.is_alive and not self._muted)
 
+                if use_audio:
+                    # wait until audio reaches this frame's time
+                    for _ in range(1000):
+                        if self._gen != gen or self._evt.is_set():
+                            break
+                        apos = a.media_position
+                        if apos >= frame_time - 0.005:
+                            break
+                        wait = min((frame_time - apos) / speed, 0.05)
+                        if wait > 0.001:
+                            time.sleep(wait)
+                        else:
+                            break
+
+                    if self._gen != gen or self._evt.is_set():
+                        break
+
+                    # skip if video fell too far behind audio
+                    apos = a.media_position
+                    if apos > frame_time + spf * 4:
+                        n += 1
+                        continue
+
+                    # keep wall0 in sync for seamless fallback
+                    wall0 = time.monotonic() - n * dspf
+                else:
+                    # wall-clock sync (no audio / muted)
+                    target = wall0 + n * dspf
+                    now = time.monotonic()
+                    dt = target - now
+                    if dt > 0.002:
+                        time.sleep(dt)
+                    elif dt < -0.1:
+                        if dt < -dspf * 5:
+                            wall0 = now - n * dspf
+                        n += 1
+                        continue
+
+                # push frame to display queue
                 try:
                     self._q.put_nowait(raw)
                 except queue.Full:
@@ -1096,8 +1270,11 @@ class Player:
                         self._q.put_nowait(raw)
                     except Exception:
                         pass
+
+                n += 1
         except (OSError, ValueError):
             pass
+
         if self._gen == gen and not self._evt.is_set():
             self._playing = False
             self._root.after(0, self._on_eof)
@@ -1118,14 +1295,10 @@ class Player:
         cmd += ["-i", self._path,
                 "-frames:v", "1", "-f", "null",
                 "-an", "-sn", "-"]
-
         try:
-            r = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=15,
-                **_pkw())
+            r = subprocess.run(cmd, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               timeout=15, **_pkw())
             txt = r.stderr.decode("utf-8", errors="ignore")
         except Exception:
             txt = ""
@@ -1134,7 +1307,6 @@ class Player:
             return
 
         hw_name = None
-
         for pat in [
             r"Using\s+auto\s+hwaccel\s+type\s+(\w+)",
             r"Using\s+(\w+)\s+hwaccel",
@@ -1148,7 +1320,6 @@ class Player:
                 if val.lower() not in ("auto", "type", "with", "new"):
                     hw_name = val
                     break
-
         if not hw_name:
             m = re.search(
                 r"(\w+(?:_cuvid|_qsv|_nvdec|_amf|_vaapi|_vdpau"
@@ -1156,7 +1327,6 @@ class Player:
                 txt, re.I)
             if m:
                 hw_name = m.group(1)
-
         if not hw_name:
             m = re.search(
                 r"\b(d3d11va|dxva2|cuda|nvdec|cuvid|qsv|vaapi|vdpau"
@@ -1164,10 +1334,8 @@ class Player:
                 txt, re.I)
             if m:
                 hw_name = m.group(1)
-
         if not hw_name and self._hwm not in ("auto", "off"):
-            check = self._hwm.lower()
-            if check in txt.lower():
+            if self._hwm.lower() in txt.lower():
                 hw_name = self._hwm
 
         if hw_name and self._gen == gen:
@@ -1180,7 +1348,7 @@ class Player:
 
     def _on_eof(self):
         self._bpp.config(text="\u25B6")
-        self._stop_audio()
+        self._audio.stop()
 
     # ── display tick (main thread, ~66 Hz) ─────────────
     def _tick(self):
@@ -1204,7 +1372,6 @@ class Player:
                 f"{self._fmt(self._ct)} / "
                 f"{self._fmt(self._info['duration'])}")
         else:
-            # drain any stale frames
             try:
                 while True:
                     self._q.get_nowait()
@@ -1395,9 +1562,22 @@ class Player:
             self._lvl.config(text=f"{self._vol}%")
         if hasattr(self, "_bmu"):
             self._mu_icon()
+        # debounce: restart audio 300 ms after last slider change
+        if self._vol_timer is not None:
+            self._root.after_cancel(self._vol_timer)
+            self._vol_timer = None
         if (self._ui_ready and self._playing
-                and self._info and self._info["has_audio"]):
-            self._start_audio(self._ct)
+                and self._info and self._info["has_audio"] and self._fy):
+            self._vol_timer = self._root.after(
+                300, self._restart_audio_vol)
+
+    def _restart_audio_vol(self):
+        self._vol_timer = None
+        if (self._playing and self._info
+                and self._info["has_audio"] and self._fy
+                and not self._muted):
+            self._audio.start(self._fy, self._path,
+                              self._ct, self._vol, self._speed)
 
     def _chg_vol(self, d):
         self._vol = max(0, min(100, self._vol + d))
@@ -1407,9 +1587,11 @@ class Player:
         self._muted = not self._muted
         self._mu_icon()
         if self._muted:
-            self._stop_audio()
-        elif self._playing and self._info and self._info["has_audio"]:
-            self._start_audio(self._ct)
+            self._audio.stop()
+        elif (self._playing and self._info
+              and self._info["has_audio"] and self._fy):
+            self._audio.start(self._fy, self._path,
+                              self._ct, self._vol, self._speed)
 
     def _mu_icon(self):
         if not hasattr(self, "_bmu"):
@@ -1567,6 +1749,7 @@ class Player:
 
     # ━━━━━━━━━━━━━━━━━━ Quit ━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _quit(self):
+        self._save_settings()
         self._kill()
         self._tip.destroy()
         try:
