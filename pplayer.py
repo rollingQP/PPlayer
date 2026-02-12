@@ -1052,34 +1052,36 @@ class Player:
         fps = self._info["fps"]
         spf = 1.0 / fps
         speed = max(0.1, self._speed)
-        dspf = spf / speed      # wall-clock duration per frame at speed
+        dspf = spf / speed
 
-        # Use wall-clock sync: both audio and video start at same wall0/t0
         t0 = self._sync_t0
         wall0 = self._sync_wall0
         n = 0
+        synced = False
         try:
             while self._gen == gen and not self._evt.is_set():
                 raw = _read_n(proc.stdout, fsz)
                 if raw is None or self._gen != gen:
                     break
                 n += 1
+
+                if not synced:
+                    synced = True
+                    wall0 = time.monotonic()
+                    self._sync_wall0 = wall0
+                    n = 1
+
                 frame_time = t0 + n * spf
                 self._ct = frame_time
 
-                # Target wall-clock time for this frame
                 tgt_wall = wall0 + n * dspf
                 now = time.monotonic()
                 dt = tgt_wall - now
 
                 if dt > 0.002:
-                    # ahead of schedule — sleep to sync with audio
                     time.sleep(dt)
                 elif dt < -0.1:
-                    # way behind — skip display but keep reading
-                    # to catch up (don't push to queue)
                     if dt < -dspf * 5:
-                        # too far behind, reset reference
                         wall0 = time.monotonic() - n * dspf
                     continue
 
