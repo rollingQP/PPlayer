@@ -120,7 +120,6 @@ _L = {
 
 # ━━━━━━━━━━━━━━━ FFmpeg helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _find(name):
-    """Locate an executable: PATH first, then ./lib/."""
     p = shutil.which(name)
     if p:
         return p
@@ -132,7 +131,6 @@ def _find(name):
 
 
 def _pkw():
-    """Platform-specific kwargs to hide console windows on Windows."""
     kw = {}
     if _W:
         si = subprocess.STARTUPINFO()
@@ -143,7 +141,6 @@ def _pkw():
 
 
 def _run_text(cmd, timeout=15):
-    """Run a command and return stdout as UTF-8 text, ignoring decode errors."""
     try:
         r = subprocess.run(
             cmd,
@@ -157,7 +154,6 @@ def _run_text(cmd, timeout=15):
 
 
 def _run_bin(cmd, timeout=5):
-    """Run a command and return raw stdout bytes."""
     try:
         r = subprocess.run(
             cmd,
@@ -171,7 +167,6 @@ def _run_bin(cmd, timeout=5):
 
 
 def _probe(ffprobe, path):
-    """Probe a media file and return metadata dict, or None on failure."""
     txt = _run_text(
         [ffprobe, "-v", "quiet", "-print_format", "json",
          "-show_format", "-show_streams", path],
@@ -209,14 +204,12 @@ def _probe(ffprobe, path):
 
 
 def _hwaccels(ffmpeg):
-    """Return list of available hwaccel methods."""
     txt = _run_text([ffmpeg, "-hwaccels"], timeout=5)
     lines = txt.strip().split("\n")
     return [l.strip() for l in lines[1:] if l.strip()]
 
 
 def _read_n(pipe, n):
-    """Read exactly n bytes from a binary pipe, or None on EOF."""
     buf = b""
     while len(buf) < n:
         ch = pipe.read(n - len(buf))
@@ -228,8 +221,6 @@ def _read_n(pipe, n):
 
 # ━━━━━━━━━━━━━━━ Widgets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class _VCanvas(tk.Canvas):
-    """Video display canvas that auto-scales images."""
-
     def __init__(self, master, **kw):
         kw.setdefault("bg", "black")
         kw.setdefault("highlightthickness", 0)
@@ -257,8 +248,6 @@ class _VCanvas(tk.Canvas):
 
 
 class _Bar(tk.Canvas):
-    """Seekable progress bar."""
-
     def __init__(self, master, **kw):
         super().__init__(master, height=24, bg="#181818",
                          highlightthickness=0, **kw)
@@ -266,6 +255,7 @@ class _Bar(tk.Canvas):
         self.pos = 0.0
         self._drag = False
         self.on_seek = None
+        self.on_drag_pos = None
         self.on_hover = None
         self.on_leave_cb = None
         self.bind("<Button-1>", self._b1)
@@ -309,11 +299,15 @@ class _Bar(tk.Canvas):
         self._draw()
         if self.on_leave_cb:
             self.on_leave_cb()
+        if self.on_drag_pos:
+            self.on_drag_pos(self.pos)
 
     def _bm(self, e):
         if self._drag:
             self.pos = self._t(e.x)
             self._draw()
+            if self.on_drag_pos:
+                self.on_drag_pos(self.pos)
 
     def _br(self, e):
         if self._drag:
@@ -337,8 +331,6 @@ class _Bar(tk.Canvas):
 
 
 class _Tip:
-    """Preview tooltip window."""
-
     def __init__(self, par):
         self._par = par
         self._w = None
@@ -380,19 +372,17 @@ class Player:
     SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
     def __init__(self):
-        # ── locate tools ───────────────────────────────
         self._ff = _find("ffmpeg")
         self._fp = _find("ffprobe")
         self._fy = _find("ffplay")
 
-        # ── state ──────────────────────────────────────
         self._lang = "en"
         self._path = None
         self._info = None
         self._playing = False
         self._paused = False
         self._ct = 0.0
-        self._vol = 80
+        self._vol = 100
         self._muted = False
         self._speed = 1.0
         self._boss = "Escape"
@@ -411,8 +401,9 @@ class Player:
         self._pbusy = False
         self._ui_ready = False
         self._click_pending = None
+        self._drag_gen = 0
+        self._drag_busy = False
 
-        # ── root window ───────────────────────────────
         self._root = TkinterDnD.Tk() if _DND else tk.Tk()
         self._root.title("Player")
         self._root.geometry("960x600")
@@ -456,7 +447,6 @@ class Player:
 
     # ━━━━━━━━━━━━━━━━━ Build UI ━━━━━━━━━━━━━━━━━━━━━━━
     def _build_ui(self):
-        # ── menu bar ──────────────────────────────────
         self._mb = tk.Menu(self._root)
         self._root.config(menu=self._mb)
 
@@ -476,7 +466,6 @@ class Player:
         self._mb.add_cascade(label="Settings", menu=self._ms)
         self._mb.add_cascade(label="Help", menu=self._mh)
 
-        # ── video canvas ──────────────────────────────
         self._cv = _VCanvas(self._root)
         self._cv.pack(fill="both", expand=True)
         self._cv.bind("<Double-1>", self._on_dbl_click)
@@ -486,21 +475,19 @@ class Player:
         self._cv.bind("<Button-4>", lambda e: self._chg_vol(5))
         self._cv.bind("<Button-5>", lambda e: self._chg_vol(-5))
 
-        # ── bottom controls ───────────────────────────
         ctrl = tk.Frame(self._root, bg="#181818", height=64)
         ctrl.pack(fill="x", side="bottom")
         ctrl.pack_propagate(False)
         self._ctrl = ctrl
 
-        # progress bar
         self._bar = _Bar(ctrl)
         self._bar.pack(fill="x", padx=4, pady=(4, 0))
         self._bar.on_seek = self._seek_to
+        self._bar.on_drag_pos = self._on_drag_preview
         self._bar.on_hover = self._prev_hover
         self._bar.on_leave_cb = self._prev_leave
         self._tip = _Tip(self._root)
 
-        # button frame
         bf = tk.Frame(ctrl, bg="#181818")
         bf.pack(fill="x", padx=4)
 
@@ -519,7 +506,6 @@ class Player:
         tk.Label(bf, textvariable=self._tv, bg="#181818", fg="#aaa",
                  font=("Consolas", 10)).pack(side="left", padx=8)
 
-        # right side: hw label + speed label
         self._lhw = tk.Label(bf, text="", bg="#181818", fg="#6a6",
                              font=("Helvetica", 9))
         self._lhw.pack(side="right", padx=4)
@@ -528,7 +514,6 @@ class Player:
                              font=("Helvetica", 9))
         self._lsp.pack(side="right", padx=4)
 
-        # volume controls — create _lvl BEFORE scale so callback can use it
         vf = tk.Frame(bf, bg="#181818")
         vf.pack(side="right")
 
@@ -536,7 +521,7 @@ class Player:
                               command=self._toggle_mute, **B)
         self._bmu.pack(side="left")
 
-        self._lvl = tk.Label(vf, text="80%", bg="#181818", fg="#aaa",
+        self._lvl = tk.Label(vf, text="100%", bg="#181818", fg="#aaa",
                              font=("Helvetica", 9), width=5)
         self._lvl.pack(side="right")
 
@@ -545,16 +530,13 @@ class Player:
         self._vsc.set(self._vol)
         self._vsc.pack(side="left")
 
-    # ── single click / double click handling ───────────
     def _on_single_click(self, event):
         self._cv.focus_set()
-        # schedule a delayed toggle; double-click will cancel it
         if self._click_pending is not None:
             self._root.after_cancel(self._click_pending)
         self._click_pending = self._root.after(300, self._do_delayed_click)
 
     def _on_dbl_click(self, event):
-        # cancel the pending single-click toggle
         if self._click_pending is not None:
             self._root.after_cancel(self._click_pending)
             self._click_pending = None
@@ -568,20 +550,17 @@ class Player:
     def _build_menus(self):
         S = self._S
 
-        # update cascade labels on menu bar (1-based index in Tk)
         self._mb.entryconfigure(1, label=S("file"))
         self._mb.entryconfigure(2, label=S("playback"))
         self._mb.entryconfigure(3, label=S("audio"))
         self._mb.entryconfigure(4, label=S("settings"))
         self._mb.entryconfigure(5, label=S("help"))
 
-        # clear all sub-menus
         for m in (self._mf, self._mp, self._ma, self._ms,
                   self._mh, self._msp, self._ml, self._mhw,
                   self._mop):
             m.delete(0, "end")
 
-        # ── File ──────────────────────────────────────
         self._mf.add_command(label=S("open"), accelerator="Ctrl+O",
                              command=self._open_file)
         self._mf.add_command(label=S("open_path"), accelerator="Ctrl+L",
@@ -591,7 +570,6 @@ class Player:
         self._mf.add_separator()
         self._mf.add_command(label=S("exit"), command=self._quit)
 
-        # ── Playback ──────────────────────────────────
         self._mp.add_command(label=S("pp"), accelerator="Space",
                              command=self._toggle_play)
         self._mp.add_command(label=S("stop"), command=self._do_stop)
@@ -616,7 +594,6 @@ class Player:
         self._mp.add_command(label=S("fs"), accelerator="F / F11",
                              command=self._toggle_fs)
 
-        # ── Audio ─────────────────────────────────────
         self._ma.add_command(label=S("vu"), accelerator="\u2191",
                              command=lambda: self._chg_vol(5))
         self._ma.add_command(label=S("vd"), accelerator="\u2193",
@@ -624,7 +601,6 @@ class Player:
         self._ma.add_command(label=S("mute"), accelerator="M",
                              command=self._toggle_mute)
 
-        # ── Settings ──────────────────────────────────
         self._ml.add_command(label="English",
                              command=lambda: self._set_lang("en"))
         self._ml.add_command(label="\u4E2D\u6587",
@@ -648,7 +624,6 @@ class Player:
                 command=lambda v=p: self._root.attributes("-alpha", v / 100))
         self._ms.add_cascade(label=S("opa"), menu=self._mop)
 
-        # ── Help ──────────────────────────────────────
         self._mh.add_command(label=S("about"), command=self._about)
 
     # ━━━━━━━━━━━━━━━ Key Bindings ━━━━━━━━━━━━━━━━━━━━━
@@ -795,8 +770,6 @@ class Player:
             except queue.Empty:
                 break
 
-        # build ffmpeg command — output raw RGB frames on stdout,
-        # stderr in binary mode for hw-detect parsing
         cmd = [self._ff]
         if self._hwm == "auto":
             cmd += ["-hwaccel", "auto"]
@@ -943,27 +916,33 @@ class Player:
             self._playing = False
             self._root.after(0, self._on_eof)
 
-    # ── stderr reader thread (binary mode, manual decode) ──
+    # ── stderr reader thread (detect hw accel name) ────
     def _sloop(self, gen):
         proc = self._vp
         if not proc or not proc.stderr:
             return
         found_hw = False
+        all_text = []
         try:
             while self._gen == gen and not self._evt.is_set():
                 raw_line = proc.stderr.readline()
                 if not raw_line:
                     break
+                txt = raw_line.decode("utf-8", errors="ignore")
+                all_text.append(txt)
                 if found_hw:
                     continue
-                # decode stderr as utf-8, ignoring bad bytes
-                txt = raw_line.decode("utf-8", errors="ignore")
-                for pat in [r"using (\w+) hwaccel",
-                            r"hwaccel type[:\s]+(\w+)",
-                            r"device type[:\s]+(\w+)",
-                            r"Hardware acceleration.*using (\w+)",
-                            r"Using hwaccel (\w+)",
-                            r"hw/accel[:\s]+(\w+)"]:
+                # Try to detect the specific hwaccel decoder being used
+                # e.g. "decoder: h264_cuvid" or "Using auto hwaccel type d3d11va"
+                for pat in [
+                    r"decoder\s*[:\s]\s*(\w+_cuvid|\w+_qsv|\w+_nvdec|\w+_amf|\w+_vaapi|\w+_vdpau|\w+_videotoolbox|\w+_mediacodec|\w+_mf|\w+_d3d11va|\w+_dxva2)",
+                    r"using\s+(\w+)\s+hwaccel",
+                    r"hwaccel\s+type\s+(\w+)",
+                    r"device\s+type\s+(\w+)",
+                    r"Using\s+hwaccel\s+(\w+)",
+                    r"HW\s+accel[:\s]+(\w+)",
+                    r"hw[/_]?accel[:\s]+(\w+)",
+                ]:
                     m = re.search(pat, txt, re.I)
                     if m:
                         self._hwd = m.group(1)
@@ -972,6 +951,23 @@ class Player:
                         break
         except Exception:
             pass
+        # If no pattern matched yet, do a second pass on accumulated text
+        if self._gen == gen and not found_hw:
+            full = "".join(all_text)
+            # Look for hwaccel type mentions in full output
+            for pat in [
+                r"using\s+(\w+)\s+hwaccel",
+                r"hwaccel\s+type\s+(\w+)",
+                r"device\s+type[:\s]+(\w+)",
+                r"HW\s+decoder[:\s]+(\w+)",
+                r"(d3d11va|dxva2|cuda|nvdec|cuvid|qsv|vaapi|vdpau|videotoolbox|mediacodec|vulkan|opencl)",
+            ]:
+                m = re.search(pat, full, re.I)
+                if m:
+                    self._hwd = m.group(1)
+                    found_hw = True
+                    self._root.after(0, self._upd_hw)
+                    break
         if self._gen == gen and not found_hw:
             self._root.after(0, self._upd_hw_sw)
 
@@ -1074,8 +1070,44 @@ class Player:
         t = max(0.0, min(self._info["duration"], self._ct + dt))
         self._seek_to(t)
 
+    # ── drag preview: show frame at dragged position in real time ──
+    def _on_drag_preview(self, t):
+        """Called continuously while user drags the progress bar."""
+        if not self._path or not self._info:
+            return
+        self._ct = t
+        self._bar.set_pos(t)
+        self._tv.set(
+            f"{self._fmt(t)} / {self._fmt(self._info['duration'])}")
+        # Throttled frame grab — skip if a previous one is still running
+        self._drag_gen += 1
+        dg = self._drag_gen
+        if self._drag_busy:
+            return
+        self._drag_busy = True
+        dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
+
+        def job():
+            cmd = [ff, "-ss", f"{t:.3f}",
+                   "-i", path,
+                   "-vframes", "1", "-f", "rawvideo",
+                   "-pix_fmt", "rgb24",
+                   "-s", f"{dw}x{dh}",
+                   "-v", "quiet", "pipe:1"]
+            data = _run_bin(cmd, timeout=3)
+            need = dw * dh * 3
+            if len(data) >= need and self._drag_gen == dg:
+                img = Image.frombytes("RGB", (dw, dh), data[:need])
+                self._frame = img
+                self._root.after(0, lambda: self._cv.show_img(img))
+            self._drag_busy = False
+            # If user moved further while we were busy, fire one more
+            if self._drag_gen != dg and self._bar._drag:
+                self._root.after(0, lambda: self._on_drag_preview(self._bar.pos))
+
+        threading.Thread(target=job, daemon=True).start()
+
     def _grab_frame(self, t):
-        """Fetch and display one frame at time t (when paused)."""
         dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
 
         def job():
@@ -1214,6 +1246,22 @@ class Player:
     def _prev_leave(self):
         self._tip.hide()
 
+    # ━━━━━━━━━━━━━━ Global tooltip cleanup ━━━━━━━━━━━━
+    def _check_tip_hide(self):
+        """Periodically check if mouse is still over the progress bar; hide tooltip if not."""
+        try:
+            mx = self._root.winfo_pointerx()
+            my = self._root.winfo_pointery()
+            bx = self._bar.winfo_rootx()
+            by = self._bar.winfo_rooty()
+            bw = self._bar.winfo_width()
+            bh = self._bar.winfo_height()
+            if not (bx <= mx <= bx + bw and by <= my <= by + bh):
+                self._tip.hide()
+        except Exception:
+            pass
+        self._root.after(300, self._check_tip_hide)
+
     # ━━━━━━━━━━━━━━ Settings Dialogs ━━━━━━━━━━━━━━━━━━
     def _set_boss(self):
         dlg = tk.Toplevel(self._root)
@@ -1299,6 +1347,7 @@ class Player:
 # ━━━━━━━━━━━━━━━ Entry Point ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if __name__ == "__main__":
     app = Player()
+    app._check_tip_hide()
     if len(sys.argv) > 1:
         p = sys.argv[1]
         if os.path.isfile(p):
