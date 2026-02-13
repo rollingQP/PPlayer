@@ -157,10 +157,8 @@ _L = {
 def _find(name):
     # 1. 确定基础路径 (兼容 PyInstaller 打包后的路径)
     if getattr(sys, 'frozen', False):
-        # 如果是打包后的 exe，基础路径是 exe 所在的文件夹
         base_path = Path(sys.executable).parent
     else:
-        # 如果是脚本直接运行，基础路径是脚本所在的文件夹
         base_path = Path(os.path.dirname(os.path.abspath(__file__)))
 
     # 2. 优先在本地 lib 目录下查找
@@ -283,7 +281,7 @@ class _AudioPlayer:
 
     def __init__(self):
         self._proc = None
-        self._proc_src = None  # ffmpeg source process
+        self._proc_src = None
         self._pos = 0.0
         self._pos_wall = 0.0
         self._seek_time = 0.0
@@ -303,8 +301,6 @@ class _AudioPlayer:
         self._ready.clear()
         self._alive = True
 
-        # Use ffmpeg to decode audio accurately from seek_time and pipe to ffplay.
-        # This ensures audio starts exactly at seek_time, matching video.
         cmd_src = [ffmpeg_path, "-ss", f"{seek_time:.3f}", "-i", file_path,
                    "-vn", "-f", "wav", "-"]
         
@@ -334,7 +330,6 @@ class _AudioPlayer:
                 cmd_play, stdin=self._proc_src.stdout,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 **_pkw())
-            # Close write end of pipe in this process so src gets SIGPIPE if play dies
             self._proc_src.stdout.close()
         except Exception:
             self._alive = False
@@ -345,7 +340,6 @@ class _AudioPlayer:
         self._alive = False
         self._ready.clear()
         
-        # Kill player
         p = self._proc
         self._proc = None
         if p:
@@ -356,7 +350,6 @@ class _AudioPlayer:
                 try: p.kill()
                 except: pass
         
-        # Kill source
         p = self._proc_src
         self._proc_src = None
         if p:
@@ -386,19 +379,9 @@ class _AudioPlayer:
             if not self._ready.is_set():
                 return self._seek_time
             elapsed = time.monotonic() - self._pos_wall
-            # ffplay output-time advances at 1× real-time even with atempo
-            # _pos is now absolute media time (seek_time + played)
-            # But ffplay reports output time (wall time).
-            # So we project:
             interp = self._pos + elapsed
             if abs(self._speed - 1.0) < 0.01:
                 return interp
-            # If speed != 1, ffplay reports wall time, so we scale elapsed
-            # Wait, _pos is derived from ffplay report + seek_time.
-            # If ffplay reports wall time, _pos is "seek_time + wall_time_reported".
-            # So interp is "seek_time + wall_time_reported + elapsed".
-            # We need to convert the (wall_time_reported + elapsed) part to media time.
-            # This is: seek_time + (interp - seek_time) * speed
             return self._seek_time + (interp - self._seek_time) * self._speed
 
     # ── internal ────────────────────────────────────────
@@ -430,8 +413,6 @@ class _AudioPlayer:
         m = self._RE_STATUS.search(line)
         if m:
             try:
-                # ffplay reading from pipe reports time starting from 0.
-                # We add seek_time to make it absolute.
                 raw_pos = float(m.group(1))
                 pos = raw_pos + self._seek_time
                 with self._lock:
@@ -452,13 +433,23 @@ class _VCanvas(tk.Canvas):
         self._ph = None
 
     def show_img(self, pil):
+        # Optimized: Only resize if absolutely necessary.
+        # The worker thread should have already resized it to fit.
         cw, ch = self.winfo_width(), self.winfo_height()
         if cw < 2 or ch < 2:
             return
+        
         iw, ih = pil.size
-        s = min(cw / iw, ch / ih)
-        nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
-        self._ph = ImageTk.PhotoImage(pil.resize((nw, nh), _BIL))
+        
+        # If size mismatch is significant, resize (fallback for drag preview etc)
+        if abs(iw - cw) > 2 or abs(ih - ch) > 2:
+             s = min(cw / iw, ch / ih)
+             nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
+             # Avoid resizing if the calculated size is the same as input
+             if nw != iw or nh != ih:
+                 pil = pil.resize((nw, nh), _BIL)
+
+        self._ph = ImageTk.PhotoImage(pil)
         self.delete("all")
         self.create_image(cw // 2, ch // 2, image=self._ph, anchor="center")
 
@@ -651,6 +642,10 @@ class Player:
         self._vol_timer = None
         self._hwd = ""
         self._sync_t0 = 0.0
+        
+        # Viewport size for background resizing
+        self._view_w = 960
+        self._view_h = 540
 
         self._sub_mode = "off"
         self._sub_ext_path = None
@@ -779,6 +774,9 @@ class Player:
                       lambda e: self._chg_vol(5 if e.delta > 0 else -5))
         self._cv.bind("<Button-4>", lambda e: self._chg_vol(5))
         self._cv.bind("<Button-5>", lambda e: self._chg_vol(-5))
+        
+        # Track window size for background resizing
+        self._cv.bind("<Configure>", self._on_view_resize)
 
         ctrl = tk.Frame(self._root, bg="#181818", height=64)
         ctrl.pack(fill="x", side="bottom")
@@ -839,6 +837,10 @@ class Player:
                               length=80, command=self._on_vol)
         self._vsc.set(self._vol)
         self._vsc.pack(side="left")
+
+    def _on_view_resize(self, event):
+        self._view_w = event.width
+        self._view_h = event.height
 
     def _on_single_click(self, event):
         self._cv.focus_set()
@@ -1269,6 +1271,23 @@ class Player:
                     first_frame = False
                     wall0 = time.monotonic()
 
+                # ── Process Image in Thread (Offload CPU from GUI) ──
+                # Convert raw bytes to PIL Image here, and resize if needed.
+                try:
+                    img = Image.frombytes("RGB", (self._dw, self._dh), raw)
+                    
+                    # Check current view size to resize in background
+                    vw, vh = self._view_w, self._view_h
+                    if vw > 1 and vh > 1:
+                        iw, ih = img.size
+                        s = min(vw / iw, vh / ih)
+                        nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
+                        # Only resize if dimensions differ significantly
+                        if nw != iw or nh != ih:
+                            img = img.resize((nw, nh), _BIL)
+                except Exception:
+                    img = None
+
                 # ── choose sync source for this frame ───
                 a = self._audio
                 use_audio = (has_audio and a.is_ready
@@ -1312,18 +1331,19 @@ class Player:
                         n += 1
                         continue
 
-                # push frame to display queue
-                try:
-                    self._q.put_nowait(raw)
-                except queue.Full:
+                # push processed image to display queue
+                if img:
                     try:
-                        self._q.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        self._q.put_nowait(raw)
-                    except Exception:
-                        pass
+                        self._q.put_nowait(img)
+                    except queue.Full:
+                        try:
+                            self._q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._q.put_nowait(img)
+                        except Exception:
+                            pass
 
                 n += 1
         except (OSError, ValueError):
@@ -1415,10 +1435,9 @@ class Player:
                 pass
             if latest is not None:
                 try:
-                    img = Image.frombytes("RGB", (self._dw, self._dh),
-                                          latest)
-                    self._frame = img
-                    self._cv.show_img(img)
+                    # latest is now a PIL Image (resized in thread), not bytes
+                    self._frame = latest
+                    self._cv.show_img(latest)
                 except Exception:
                     pass
             self._bar.set_pos(self._ct)
