@@ -9,6 +9,8 @@ FFmpeg is searched in PATH first, then in ./lib/ beside this script.
 import tkinter as tk
 from tkinter import ttk, filedialog
 import subprocess, threading, time, os, sys, platform, json, queue, shutil, re
+import tempfile
+import uuid
 from pathlib import Path
 
 try:
@@ -93,6 +95,7 @@ _L = {
         "eo": "Cannot open:\n{}",
         "ok": "OK",
         "cancel": "Cancel",
+        "sub_extracting": "Loading subtitles (RAM)...",
     },
     "zh": {
         "title": "PPlayer",
@@ -149,19 +152,18 @@ _L = {
         "eo": "无法打开：\n{}",
         "ok": "确定",
         "cancel": "取消",
+        "sub_extracting": "正在加载字幕 (内存)...",
     },
 }
 
 
 # ━━━━━━━━━━━━━━━ FFmpeg helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _find(name):
-    # 1. 确定基础路径 (兼容 PyInstaller 打包后的路径)
     if getattr(sys, 'frozen', False):
         base_path = Path(sys.executable).parent
     else:
         base_path = Path(os.path.dirname(os.path.abspath(__file__)))
 
-    # 2. 优先在本地 lib 目录下查找
     lib_dir = base_path / "lib"
     target_exe = f"{name}.exe" if _W else name
     local_path = lib_dir / target_exe
@@ -169,7 +171,6 @@ def _find(name):
     if local_path.is_file():
         return str(local_path)
 
-    # 3. 如果本地没找到，再检查系统 PATH
     system_path = shutil.which(name)
     if system_path:
         return system_path
@@ -277,8 +278,6 @@ def _read_n(pipe, n):
 
 # ━━━━━━━━━━━━━━━ Audio Player (master clock) ━━━━━━━━━━━━━━━
 class _AudioPlayer:
-    """Wraps ffplay; reads stderr in real-time to track audio position."""
-
     def __init__(self):
         self._proc = None
         self._proc_src = None
@@ -290,7 +289,6 @@ class _AudioPlayer:
         self._lock = threading.Lock()
         self._alive = False
 
-    # ── public API ──────────────────────────────────────
     def start(self, ffplay_path, ffmpeg_path, file_path, seek_time, volume, speed):
         self.stop()
         self._speed = max(0.1, speed)
@@ -374,7 +372,6 @@ class _AudioPlayer:
 
     @property
     def media_position(self):
-        """Estimated current media-time (interpolated between reports)."""
         with self._lock:
             if not self._ready.is_set():
                 return self._seek_time
@@ -384,7 +381,6 @@ class _AudioPlayer:
                 return interp
             return self._seek_time + (interp - self._seek_time) * self._speed
 
-    # ── internal ────────────────────────────────────────
     def _reader(self):
         proc = self._proc
         if not proc:
@@ -433,19 +429,14 @@ class _VCanvas(tk.Canvas):
         self._ph = None
 
     def show_img(self, pil):
-        # Optimized: Only resize if absolutely necessary.
-        # The worker thread should have already resized it to fit.
         cw, ch = self.winfo_width(), self.winfo_height()
         if cw < 2 or ch < 2:
             return
         
         iw, ih = pil.size
-        
-        # If size mismatch is significant, resize (fallback for drag preview etc)
         if abs(iw - cw) > 2 or abs(ih - ch) > 2:
              s = min(cw / iw, ch / ih)
              nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
-             # Avoid resizing if the calculated size is the same as input
              if nw != iw or nh != ih:
                  pil = pil.resize((nw, nh), _BIL)
 
@@ -643,12 +634,17 @@ class Player:
         self._hwd = ""
         self._sync_t0 = 0.0
         
-        # Viewport size for background resizing
         self._view_w = 960
         self._view_h = 540
 
         self._sub_mode = "off"
         self._sub_ext_path = None
+        
+        # Memory-based subtitle handling
+        self._sub_data = None  # Bytes of the subtitle file
+        self._sub_pipe_name = None
+        self._sub_thread = None
+        self._sub_stop_evt = threading.Event()
 
         self._root = TkinterDnD.Tk() if _DND else tk.Tk()
         self._root.title("PPlayer")
@@ -668,7 +664,6 @@ class Player:
         self._build_menus()
         self._bind_keys()
 
-        # apply loaded settings to UI widgets
         self._vsc.set(self._vol)
         self._lsp.config(text=f"{self._speed}x")
         self._mu_icon()
@@ -683,7 +678,6 @@ class Player:
     def run(self):
         self._root.mainloop()
 
-    # ── i18n helper ─────────────────────────────────────
     def _S(self, k):
         return _L.get(self._lang, _L["en"]).get(k, k)
 
@@ -698,7 +692,6 @@ class Player:
         key = "hint" if _DND else "hint_nodnd"
         self._cv.show_txt(self._S(key))
 
-    # ━━━━━━━━━━━━━ Settings persistence ━━━━━━━━━━━━━━━━
     def _load_settings(self):
         defaults = dict(lang="en", volume=100, speed=1.0,
                         hw_mode="auto", boss_key="Escape",
@@ -713,7 +706,6 @@ class Player:
                         defaults[k] = d[k]
         except Exception:
             pass
-        # validate
         if defaults["lang"] not in _L:
             defaults["lang"] = "en"
         defaults["volume"] = max(0, min(100, int(defaults["volume"])))
@@ -743,7 +735,6 @@ class Player:
         except Exception:
             pass
 
-    # ━━━━━━━━━━━━━━━━━ Build UI ━━━━━━━━━━━━━━━━━━━━━━━━
     def _build_ui(self):
         self._mb = tk.Menu(self._root)
         self._root.config(menu=self._mb)
@@ -775,7 +766,6 @@ class Player:
         self._cv.bind("<Button-4>", lambda e: self._chg_vol(5))
         self._cv.bind("<Button-5>", lambda e: self._chg_vol(-5))
         
-        # Track window size for background resizing
         self._cv.bind("<Configure>", self._on_view_resize)
 
         ctrl = tk.Frame(self._root, bg="#181818", height=64)
@@ -821,7 +811,6 @@ class Player:
         vf = tk.Frame(bf, bg="#181818")
         vf.pack(side="right")
 
-        # Fullscreen button
         self._bfs = tk.Button(vf, text="⛶", command=self._toggle_fs, **B)
         self._bfs.pack(side="right", padx=4)
 
@@ -858,7 +847,6 @@ class Player:
         self._click_pending = None
         self._toggle_play()
 
-    # ━━━━━━━━━━━━━━━ Populate Menus ━━━━━━━━━━━━━━━━━━━
     def _build_menus(self):
         S = self._S
 
@@ -914,16 +902,16 @@ class Player:
         self._ma.add_command(label=S("mute"), accelerator="M",
                              command=self._toggle_mute)
 
-        # subtitle menu
         self._msub.add_command(label=S("sub_off"),
                                command=self._sub_off)
         self._msub.add_separator()
         if self._info and self._info.get("subs"):
             for sub in self._info["subs"]:
                 si = sub["stream_idx"]
+                codec = sub.get("codec", "")
                 self._msub.add_command(
                     label=sub["label"],
-                    command=lambda idx=si: self._sub_embed(idx))
+                    command=lambda idx=si, c=codec: self._sub_embed(idx, c))
             self._msub.add_separator()
         self._msub.add_command(label=S("sub_ext"),
                                command=self._sub_load_ext)
@@ -963,7 +951,6 @@ class Player:
         self._opacity = max(0.3, min(1.0, pct / 100.0))
         self._root.attributes("-alpha", self._opacity)
 
-    # ━━━━━━━━━━━━━━━ Key Bindings ━━━━━━━━━━━━━━━━━━━━━
     def _bind_keys(self):
         r = self._root
         r.bind("<space>", lambda e: self._toggle_play())
@@ -1002,7 +989,6 @@ class Player:
     def _toggle_boss_any(self):
         self._boss_any = self._boss_any_var.get()
 
-    # ━━━━━━━━━━━━━━━ Language ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _set_lang(self, c):
         self._lang = c
         self._apply_lang()
@@ -1015,7 +1001,6 @@ class Player:
             if self._path else self._S("title"))
         self._build_menus()
 
-    # ━━━━━━━━━━━━━ Drag and Drop ━━━━━━━━━━━━━━━━━━━━━━
     def _on_drop(self, event):
         p = event.data.strip()
         if p.startswith("{"):
@@ -1026,7 +1011,6 @@ class Player:
         if p:
             self._open_video(p)
 
-    # ━━━━━━━━━━━━━ File Dialogs ━━━━━━━━━━━━━━━━━━━━━━━
     def _open_file(self):
         ft = [("Video",
                "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v "
@@ -1071,27 +1055,159 @@ class Player:
         if res[0]:
             self._open_video(res[0])
 
-    # ━━━━━━━━━━━━━ Subtitle ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━ Subtitle Logic (Memory Based) ━━━━━━━━━━━━━
     def _sub_off(self):
         changed = self._sub_mode != "off"
         self._sub_mode = "off"
         self._sub_ext_path = None
+        self._cleanup_sub_pipe()
         if changed and self._playing:
             t = self._ct
             self._kill()
             self._start(t)
 
-    def _sub_embed(self, stream_idx):
-        new_mode = f"embed:{stream_idx}"
-        changed = self._sub_mode != new_mode
-        self._sub_mode = new_mode
-        self._sub_ext_path = None
-        if changed and self._playing:
-            t = self._ct
+    def _cleanup_sub_pipe(self):
+        self._sub_stop_evt.set()
+        if self._sub_thread and self._sub_thread.is_alive():
+            self._sub_thread.join(timeout=0.2)
+        self._sub_thread = None
+        
+        if self._sub_pipe_name:
+            if not _W:
+                try:
+                    os.unlink(self._sub_pipe_name)
+                except:
+                    pass
+        self._sub_pipe_name = None
+        self._sub_data = None
+
+    def _extract_subtitle_to_mem(self, stream_idx, codec):
+        """Extracts subtitle stream to RAM (bytes)."""
+        ext = "srt"
+        if "ass" in codec or "ssa" in codec:
+            ext = "ass"
+        elif "vtt" in codec:
+            ext = "vtt"
+        
+        self._cv.show_txt(self._S("sub_extracting"))
+        self._root.update()
+
+        cmd = [self._ff, "-y", "-i", self._path, "-map", f"0:s:{stream_idx}"]
+        cmd += ["-f", ext, "-"] # Output to stdout
+
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, **_pkw())
+            return r.stdout
+        except Exception:
+            return None
+
+    def _serve_pipe_windows(self, pipe_name, data):
+        import ctypes
+        from ctypes import wintypes
+        
+        kernel32 = ctypes.windll.kernel32
+        
+        PIPE_ACCESS_OUTBOUND = 0x00000002
+        PIPE_TYPE_BYTE = 0x00000000
+        PIPE_WAIT = 0x00000000
+        PIPE_UNLIMITED_INSTANCES = 255
+        INVALID_HANDLE_VALUE = -1
+        
+        while not self._sub_stop_evt.is_set():
+            h_pipe = kernel32.CreateNamedPipeW(
+                pipe_name,
+                PIPE_ACCESS_OUTBOUND,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                65536, 65536,
+                0, None
+            )
+            
+            if h_pipe == INVALID_HANDLE_VALUE:
+                time.sleep(0.1)
+                continue
+                
+            # Wait for client (ffmpeg) to connect
+            connected = kernel32.ConnectNamedPipe(h_pipe, None)
+            if connected or kernel32.GetLastError() == 535: # ERROR_PIPE_CONNECTED
+                try:
+                    written = wintypes.DWORD(0)
+                    kernel32.WriteFile(h_pipe, data, len(data), ctypes.byref(written), None)
+                    kernel32.FlushFileBuffers(h_pipe)
+                except:
+                    pass
+                finally:
+                    kernel32.DisconnectNamedPipe(h_pipe)
+            
+            kernel32.CloseHandle(h_pipe)
+
+    def _serve_pipe_posix(self, pipe_path, data):
+        while not self._sub_stop_evt.is_set():
+            try:
+                # Open blocks until reader connects
+                fd = os.open(pipe_path, os.O_WRONLY)
+                os.write(fd, data)
+                os.close(fd)
+            except OSError:
+                time.sleep(0.1)
+
+    def _setup_sub_pipe(self, data):
+        self._sub_stop_evt.clear()
+        self._sub_data = data
+        
+        if _W:
+            # Windows Named Pipe
+            pipe_name = f"\\\\.\\pipe\\pplayer_sub_{uuid.uuid4().hex}"
+            self._sub_pipe_name = pipe_name
+            self._sub_thread = threading.Thread(
+                target=self._serve_pipe_windows,
+                args=(pipe_name, data),
+                daemon=True
+            )
+            self._sub_thread.start()
+            return pipe_name
+        else:
+            # POSIX FIFO
+            tmp_dir = tempfile.gettempdir()
+            pipe_name = os.path.join(tmp_dir, f"pplayer_sub_{uuid.uuid4().hex}")
+            try:
+                os.mkfifo(pipe_name)
+            except OSError:
+                return None
+            self._sub_pipe_name = pipe_name
+            self._sub_thread = threading.Thread(
+                target=self._serve_pipe_posix,
+                args=(pipe_name, data),
+                daemon=True
+            )
+            self._sub_thread.start()
+            return pipe_name
+
+    def _sub_embed(self, stream_idx, codec=""):
+        self._cleanup_sub_pipe()
+        
+        was_playing = self._playing
+        if was_playing:
             self._kill()
-            self._start(t)
-        elif changed and self._paused:
+        
+        data = self._extract_subtitle_to_mem(stream_idx, codec)
+        
+        if data and len(data) > 0:
+            pipe_path = self._setup_sub_pipe(data)
+            if pipe_path:
+                self._sub_mode = "pipe"
+                self._sub_ext_path = pipe_path # Reuse this var for pipe path
+            else:
+                self._sub_mode = "off"
+        else:
+            self._sub_mode = "off"
+
+        if was_playing:
+            self._start(self._ct)
+        elif self._paused:
             self._grab_frame(self._ct)
+        else:
+            self._show_hint()
 
     def _sub_load_ext(self):
         ft = [("Subtitle",
@@ -1099,6 +1215,7 @@ class Player:
               ("All", "*.*")]
         p = filedialog.askopenfilename(filetypes=ft)
         if p:
+            self._cleanup_sub_pipe()
             self._sub_mode = "ext"
             self._sub_ext_path = p
             if self._playing:
@@ -1110,23 +1227,22 @@ class Player:
 
     def _build_vf_filter(self):
         parts = []
-        if self._sub_mode.startswith("embed:"):
-            idx = int(self._sub_mode.split(":")[1])
-            if self._path:
-                safe = self._path.replace("\\", "/")
-                safe = safe.replace(":", "\\:")
-                safe = safe.replace("'", "\\'")
-                parts.append(f"subtitles='{safe}':si={idx}")
-        elif self._sub_mode == "ext" and self._sub_ext_path:
-            safe = self._sub_ext_path.replace("\\", "/")
+        parts.append(f"scale={self._dw}:{self._dh}")
+
+        path_to_use = None
+        if self._sub_mode == "ext":
+            path_to_use = self._sub_ext_path
+        elif self._sub_mode == "pipe":
+            path_to_use = self._sub_ext_path # This holds the pipe path
+
+        if path_to_use:
+            safe = path_to_use.replace("\\", "/")
             safe = safe.replace(":", "\\:")
             safe = safe.replace("'", "\\'")
             parts.append(f"subtitles='{safe}'")
             
-        parts.append(f"scale={self._dw}:{self._dh}")
         return ",".join(parts)
 
-    # ━━━━━━━━━━━━━ Open Video ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _open_video(self, path):
         self._do_close()
         if not self._fp:
@@ -1143,6 +1259,7 @@ class Player:
         self._pcache.clear()
         self._sub_mode = "off"
         self._sub_ext_path = None
+        self._cleanup_sub_pipe()
 
         w, h = info["width"], info["height"]
         if h > 1080:
@@ -1156,7 +1273,6 @@ class Player:
         self._build_menus()
         self._start(0.0)
 
-    # ━━━━━━━━━━━━━━━━ Playback Engine ━━━━━━━━━━━━━━━━━
     def _start(self, t):
         self._evt.clear()
         self._gen += 1
@@ -1173,7 +1289,6 @@ class Player:
             except queue.Empty:
                 break
 
-        # ── video process ───────────────────────────────
         cmd = [self._ff]
         if self._hwm == "auto":
             cmd += ["-hwaccel", "auto"]
@@ -1188,6 +1303,7 @@ class Player:
 
         vf = self._build_vf_filter()
         cmd += ["-vf", vf]
+
         cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-an", "-sn",
                 "-v", "error", "pipe:1"]
@@ -1201,7 +1317,6 @@ class Player:
             self._playing = False
             return
 
-        # ── audio process (master clock) ────────────────
         if self._info["has_audio"] and self._fy and not self._muted:
             self._audio.start(self._fy, self._ff, self._path,
                               t, self._vol, self._speed)
@@ -1235,7 +1350,6 @@ class Player:
             except queue.Empty:
                 break
 
-    # ── video reader thread (syncs to audio clock) ─────
     def _vloop(self, gen):
         proc = self._vp
         if not proc:
@@ -1250,7 +1364,6 @@ class Player:
         has_audio = (self._info["has_audio"] and not self._muted
                      and self._fy is not None)
 
-        # give audio time to start
         if has_audio:
             self._audio.wait_ready(timeout=3.0)
 
@@ -1271,30 +1384,24 @@ class Player:
                     first_frame = False
                     wall0 = time.monotonic()
 
-                # ── Process Image in Thread (Offload CPU from GUI) ──
-                # Convert raw bytes to PIL Image here, and resize if needed.
                 try:
                     img = Image.frombytes("RGB", (self._dw, self._dh), raw)
                     
-                    # Check current view size to resize in background
                     vw, vh = self._view_w, self._view_h
                     if vw > 1 and vh > 1:
                         iw, ih = img.size
                         s = min(vw / iw, vh / ih)
                         nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
-                        # Only resize if dimensions differ significantly
                         if nw != iw or nh != ih:
                             img = img.resize((nw, nh), _BIL)
                 except Exception:
                     img = None
 
-                # ── choose sync source for this frame ───
                 a = self._audio
                 use_audio = (has_audio and a.is_ready
                              and a.is_alive and not self._muted)
 
                 if use_audio:
-                    # wait until audio reaches this frame's time
                     for _ in range(1000):
                         if self._gen != gen or self._evt.is_set():
                             break
@@ -1310,16 +1417,13 @@ class Player:
                     if self._gen != gen or self._evt.is_set():
                         break
 
-                    # skip if video fell too far behind audio
                     apos = a.media_position
                     if apos > frame_time + spf * 4:
                         n += 1
                         continue
 
-                    # keep wall0 in sync for seamless fallback
                     wall0 = time.monotonic() - n * dspf
                 else:
-                    # wall-clock sync (no audio / muted)
                     target = wall0 + n * dspf
                     now = time.monotonic()
                     dt = target - now
@@ -1331,7 +1435,6 @@ class Player:
                         n += 1
                         continue
 
-                # push processed image to display queue
                 if img:
                     try:
                         self._q.put_nowait(img)
@@ -1353,7 +1456,6 @@ class Player:
             self._playing = False
             self._root.after(0, self._on_eof)
 
-    # ── hardware accel detection thread ────────────────
     def _detect_hw_thread(self, gen):
         if self._hwm == "off":
             if self._gen == gen:
@@ -1424,7 +1526,6 @@ class Player:
         self._bpp.config(text="\u25B6")
         self._audio.stop()
 
-    # ── display tick (main thread, ~66 Hz) ─────────────
     def _tick(self):
         if self._playing:
             latest = None
@@ -1435,7 +1536,6 @@ class Player:
                 pass
             if latest is not None:
                 try:
-                    # latest is now a PIL Image (resized in thread), not bytes
                     self._frame = latest
                     self._cv.show_img(latest)
                 except Exception:
@@ -1452,7 +1552,6 @@ class Player:
                 pass
         self._root.after(15, self._tick)
 
-    # ━━━━━━━━━━━━━━ Playback Controls ━━━━━━━━━━━━━━━━━
     def _toggle_play(self):
         if not self._path:
             return
@@ -1492,10 +1591,10 @@ class Player:
         self._tv.set("00:00 / 00:00")
         self._sub_mode = "off"
         self._sub_ext_path = None
+        self._cleanup_sub_pipe()
         self._root.title(self._S("title"))
         self._show_hint()
 
-    # ── drag: start / move / release ───────────────────
     def _on_drag_start(self):
         self._drag_was_playing = self._playing
         if self._playing:
@@ -1627,7 +1726,6 @@ class Player:
         idx = max(0, min(len(self.SPEEDS) - 1, idx + d))
         self._set_speed(self.SPEEDS[idx])
 
-    # ━━━━━━━━━━━━━━━━ Volume ━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _on_vol(self, val):
         self._vol = int(float(val))
         self._muted = False
@@ -1635,7 +1733,6 @@ class Player:
             self._lvl.config(text=f"{self._vol}%")
         if hasattr(self, "_bmu"):
             self._mu_icon()
-        # debounce: restart audio 300 ms after last slider change
         if self._vol_timer is not None:
             self._root.after_cancel(self._vol_timer)
             self._vol_timer = None
@@ -1676,7 +1773,6 @@ class Player:
         else:
             self._bmu.config(text="\U0001F50A")
 
-    # ━━━━━━━━━━━━━━━ Fullscreen ━━━━━━━━━━━━━━━━━━━━━━━
     def _toggle_fs(self):
         self._fsc = not self._fsc
         self._root.attributes("-fullscreen", self._fsc)
@@ -1685,7 +1781,6 @@ class Player:
         else:
             self._root.config(menu=self._mb)
 
-    # ━━━━━━━━━━━━━ Preview Tooltip ━━━━━━━━━━━━━━━━━━━━
     def _prev_hover(self, t, sx, sy):
         if not self._info or not self._path:
             return
@@ -1744,7 +1839,6 @@ class Player:
             pass
         self._root.after(300, self._check_tip_hide)
 
-    # ━━━━━━━━━━━━━━ Settings Dialogs ━━━━━━━━━━━━━━━━━━
     def _set_boss(self):
         dlg = tk.Toplevel(self._root)
         dlg.title(self._S("boss"))
@@ -1771,7 +1865,6 @@ class Player:
             self._kill()
             self._start(t)
 
-    # ━━━━━━━━━━━━━━━━ Dialogs ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _about(self):
         dlg = tk.Toplevel(self._root)
         dlg.title(self._S("about"))
@@ -1818,10 +1911,10 @@ class Player:
                   command=dlg.destroy).pack(pady=8)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
-    # ━━━━━━━━━━━━━━━━━━ Quit ━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _quit(self):
         self._save_settings()
         self._kill()
+        self._cleanup_sub_pipe()
         self._tip.destroy()
         try:
             self._root.destroy()
@@ -1829,7 +1922,6 @@ class Player:
             pass
 
 
-# ━━━━━━━━━━━━━━━ Entry Point ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if __name__ == "__main__":
     app = Player()
     app._check_tip_hide()
