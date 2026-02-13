@@ -269,6 +269,7 @@ class _AudioPlayer:
 
     def __init__(self):
         self._proc = None
+        self._proc_src = None  # ffmpeg source process
         self._pos = 0.0
         self._pos_wall = 0.0
         self._seek_time = 0.0
@@ -278,7 +279,7 @@ class _AudioPlayer:
         self._alive = False
 
     # ── public API ──────────────────────────────────────
-    def start(self, ffplay_path, file_path, seek_time, volume, speed):
+    def start(self, ffplay_path, ffmpeg_path, file_path, seek_time, volume, speed):
         self.stop()
         self._speed = max(0.1, speed)
         self._seek_time = seek_time
@@ -288,11 +289,15 @@ class _AudioPlayer:
         self._ready.clear()
         self._alive = True
 
-        cmd = [ffplay_path, "-nodisp", "-autoexit", "-vn",
-               "-loglevel", "info"]
-        if seek_time > 0.5:
-            cmd += ["-ss", f"{seek_time:.3f}"]
-        cmd += ["-volume", str(volume)]
+        # Use ffmpeg to decode audio accurately from seek_time and pipe to ffplay.
+        # This ensures audio starts exactly at seek_time, matching video.
+        cmd_src = [ffmpeg_path, "-ss", f"{seek_time:.3f}", "-i", file_path,
+                   "-vn", "-f", "wav", "-"]
+        
+        cmd_play = [ffplay_path, "-nodisp", "-autoexit", "-vn",
+                    "-loglevel", "info"]
+        cmd_play += ["-volume", str(volume)]
+        
         if abs(speed - 1.0) > 0.01:
             parts = []
             v = speed
@@ -303,14 +308,20 @@ class _AudioPlayer:
                 parts.append("atempo=0.5")
                 v *= 2.0
             parts.append(f"atempo={v:.4f}")
-            cmd += ["-af", ",".join(parts)]
-        cmd += ["-i", file_path]
+            cmd_play += ["-af", ",".join(parts)]
+        
+        cmd_play += ["-i", "-"]
 
         try:
+            self._proc_src = subprocess.Popen(
+                cmd_src, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                **_pkw())
             self._proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL,
+                cmd_play, stdin=self._proc_src.stdout,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 **_pkw())
+            # Close write end of pipe in this process so src gets SIGPIPE if play dies
+            self._proc_src.stdout.close()
         except Exception:
             self._alive = False
             return
@@ -319,20 +330,28 @@ class _AudioPlayer:
     def stop(self):
         self._alive = False
         self._ready.clear()
-        proc = self._proc
+        
+        # Kill player
+        p = self._proc
         self._proc = None
-        if proc:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        if p:
+            try: p.terminate()
+            except: pass
+            try: p.wait(timeout=0.5)
+            except: 
+                try: p.kill()
+                except: pass
+        
+        # Kill source
+        p = self._proc_src
+        self._proc_src = None
+        if p:
+            try: p.terminate()
+            except: pass
+            try: p.wait(timeout=0.5)
+            except:
+                try: p.kill()
+                except: pass
 
     def wait_ready(self, timeout=5.0):
         return self._ready.wait(timeout)
@@ -354,10 +373,18 @@ class _AudioPlayer:
                 return self._seek_time
             elapsed = time.monotonic() - self._pos_wall
             # ffplay output-time advances at 1× real-time even with atempo
+            # _pos is now absolute media time (seek_time + played)
+            # But ffplay reports output time (wall time).
+            # So we project:
             interp = self._pos + elapsed
             if abs(self._speed - 1.0) < 0.01:
                 return interp
-            # convert output-time → media-time for non-1× speed
+            # If speed != 1, ffplay reports wall time, so we scale elapsed
+            # Wait, _pos is derived from ffplay report + seek_time.
+            # If ffplay reports wall time, _pos is "seek_time + wall_time_reported".
+            # So interp is "seek_time + wall_time_reported + elapsed".
+            # We need to convert the (wall_time_reported + elapsed) part to media time.
+            # This is: seek_time + (interp - seek_time) * speed
             return self._seek_time + (interp - self._seek_time) * self._speed
 
     # ── internal ────────────────────────────────────────
@@ -389,7 +416,10 @@ class _AudioPlayer:
         m = self._RE_STATUS.search(line)
         if m:
             try:
-                pos = float(m.group(1))
+                # ffplay reading from pipe reports time starting from 0.
+                # We add seek_time to make it absolute.
+                raw_pos = float(m.group(1))
+                pos = raw_pos + self._seek_time
                 with self._lock:
                     self._pos = pos
                     self._pos_wall = time.monotonic()
@@ -779,6 +809,10 @@ class Player:
         vf = tk.Frame(bf, bg="#181818")
         vf.pack(side="right")
 
+        # Fullscreen button
+        self._bfs = tk.Button(vf, text="⛶", command=self._toggle_fs, **B)
+        self._bfs.pack(side="right", padx=4)
+
         self._bmu = tk.Button(vf, text="\U0001F50A",
                               command=self._toggle_mute, **B)
         self._bmu.pack(side="left")
@@ -1063,15 +1097,9 @@ class Player:
         if self._sub_mode.startswith("embed:"):
             idx = int(self._sub_mode.split(":")[1])
             if self._path:
-                # 1. 将反斜杠替换为正斜杠，避免转义歧义
                 safe = self._path.replace("\\", "/")
-                # 2. 关键修复：在 Windows 上，必须转义驱动器后的冒号 (C: -> C\:)
-                #    注意这里只用一个反斜杠转义 (Python字符串写作 "\\:")
                 safe = safe.replace(":", "\\:")
-                # 3. 转义文件名内部的单引号
                 safe = safe.replace("'", "\\'")
-                # 注意：不要转义 [ 或 ]，也不要使用双重反斜杠转义冒号
-                
                 parts.append(f"subtitles='{safe}':si={idx}")
         elif self._sub_mode == "ext" and self._sub_ext_path:
             safe = self._sub_ext_path.replace("\\", "/")
@@ -1081,8 +1109,6 @@ class Player:
             
         parts.append(f"scale={self._dw}:{self._dh}")
         return ",".join(parts)
-
-
 
     # ━━━━━━━━━━━━━ Open Video ━━━━━━━━━━━━━━━━━━━━━━━━━
     def _open_video(self, path):
@@ -1141,10 +1167,7 @@ class Player:
         if t > 0.5:
             cmd += ["-ss", f"{t:.3f}"]
 
-        # 【修复关键点】：添加 -copyts 参数
-        # 这保留了原始时间戳，确保字幕滤镜能正确匹配视频帧
         cmd += ["-copyts"]
-
         cmd += ["-i", self._path]
 
         vf = self._build_vf_filter()
@@ -1164,7 +1187,7 @@ class Player:
 
         # ── audio process (master clock) ────────────────
         if self._info["has_audio"] and self._fy and not self._muted:
-            self._audio.start(self._fy, self._path,
+            self._audio.start(self._fy, self._ff, self._path,
                               t, self._vol, self._speed)
 
         self._sync_t0 = t
@@ -1593,7 +1616,7 @@ class Player:
         if (self._playing and self._info
                 and self._info["has_audio"] and self._fy
                 and not self._muted):
-            self._audio.start(self._fy, self._path,
+            self._audio.start(self._fy, self._ff, self._path,
                               self._ct, self._vol, self._speed)
 
     def _chg_vol(self, d):
@@ -1607,7 +1630,7 @@ class Player:
             self._audio.stop()
         elif (self._playing and self._info
               and self._info["has_audio"] and self._fy):
-            self._audio.start(self._fy, self._path,
+            self._audio.start(self._fy, self._ff, self._path,
                               self._ct, self._vol, self._speed)
 
     def _mu_icon(self):
@@ -1625,10 +1648,8 @@ class Player:
         self._fsc = not self._fsc
         self._root.attributes("-fullscreen", self._fsc)
         if self._fsc:
-            self._ctrl.pack_forget()
             self._root.config(menu="")
         else:
-            self._ctrl.pack(fill="x", side="bottom")
             self._root.config(menu=self._mb)
 
     # ━━━━━━━━━━━━━ Preview Tooltip ━━━━━━━━━━━━━━━━━━━━
