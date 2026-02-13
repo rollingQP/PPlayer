@@ -155,13 +155,27 @@ _L = {
 
 # ━━━━━━━━━━━━━━━ FFmpeg helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _find(name):
-    p = shutil.which(name)
-    if p:
-        return p
-    lib = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) / "lib"
-    c = lib / (f"{name}.exe" if _W else name)
-    if c.is_file():
-        return str(c)
+    # 1. 确定基础路径 (兼容 PyInstaller 打包后的路径)
+    if getattr(sys, 'frozen', False):
+        # 如果是打包后的 exe，基础路径是 exe 所在的文件夹
+        base_path = Path(sys.executable).parent
+    else:
+        # 如果是脚本直接运行，基础路径是脚本所在的文件夹
+        base_path = Path(os.path.dirname(os.path.abspath(__file__)))
+
+    # 2. 优先在本地 lib 目录下查找
+    lib_dir = base_path / "lib"
+    target_exe = f"{name}.exe" if _W else name
+    local_path = lib_dir / target_exe
+    
+    if local_path.is_file():
+        return str(local_path)
+
+    # 3. 如果本地没找到，再检查系统 PATH
+    system_path = shutil.which(name)
+    if system_path:
+        return system_path
+        
     return None
 
 
