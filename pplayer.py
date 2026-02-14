@@ -16,6 +16,7 @@ import threading
 import re
 import platform
 import atexit
+import socket
 from pathlib import Path
 
 # ── Dependency Checks ──────────────────────────────────────
@@ -114,6 +115,7 @@ _L = {
         "help": "Help",
         "about": "About",
         "abt": "PPlayer (OpenGL)\nHigh-performance FFmpeg player.",
+        "safe_desc": "No playback history recorded. No traces left.",
         "hint": "Drop a video file here\nor use File → Open",
         "htag": "HW: {}",
         "stag": "SW Decode",
@@ -124,6 +126,8 @@ _L = {
         "ok": "OK",
         "cancel": "Cancel",
         "sub_extracting": "Loading subtitles...",
+        "ff_path": "FFmpeg Path: {}",
+        "sub_fail": "Failed to load subtitle:\n{}",
     },
     "zh": {
         "title": "PPlayer",
@@ -161,6 +165,7 @@ _L = {
         "help": "帮助",
         "about": "关于",
         "abt": "PPlayer (OpenGL)\n高性能 FFmpeg 播放器。",
+        "safe_desc": "不记录播放历史，不留任何痕迹。",
         "hint": "拖放视频文件到此处\n或使用 文件→打开",
         "htag": "硬解: {}",
         "stag": "软件解码",
@@ -171,6 +176,8 @@ _L = {
         "ok": "确定",
         "cancel": "取消",
         "sub_extracting": "正在加载字幕...",
+        "ff_path": "FFmpeg 路径: {}",
+        "sub_fail": "加载字幕失败：\n{}",
     },
 }
 
@@ -235,10 +242,16 @@ def _probe(ffprobe, path):
             tags = s.get("tags", {})
             lang = tags.get("language", tags.get("title", f"#{sub_idx}"))
             title = tags.get("title", "")
+            codec = s.get("codec_name", "unknown")
             label = f"#{sub_idx}"
             if title: label += f" {title}"
             if lang and lang != title: label += f" ({lang})"
-            info["subs"].append({"index": int(s.get("index", sub_idx)), "stream_idx": sub_idx, "label": label})
+            info["subs"].append({
+                "index": int(s.get("index", sub_idx)), 
+                "stream_idx": sub_idx, 
+                "label": label,
+                "codec": codec
+            })
             sub_idx += 1
     return info if info["width"] > 0 else None
 
@@ -352,6 +365,27 @@ class _AudioPlayer:
         except: pass
         self._alive = False
 
+# ━━━━━━━━━━━━━━━ Subtitle Server (Memory) ━━━━━━━━━━━━━━━
+class MemSubServer(threading.Thread):
+    def __init__(self, data):
+        super().__init__(daemon=True)
+        self.data = data
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(('127.0.0.1', 0))
+        self.port = self.sock.getsockname()[1]
+        self.sock.listen(1)
+
+    def run(self):
+        try:
+            self.sock.settimeout(10)
+            conn, _ = self.sock.accept()
+            with conn:
+                conn.sendall(self.data)
+        except: pass
+        finally:
+            try: self.sock.close()
+            except: pass
+
 # ━━━━━━━━━━━━━━━ OpenGL Video Widget ━━━━━━━━━━━━━━━━━━━
 class YUVOpenGLWidget(QOpenGLWidget):
     doubleClicked = pyqtSignal()
@@ -447,7 +481,6 @@ class YUVOpenGLWidget(QOpenGLWidget):
             self._program.setUniformValue("tex_u", 1)
             self._program.setUniformValue("tex_v", 2)
 
-            # FIX: Use list of tuples for PyQt6 setAttributeArray
             vertices = [
                 (-1.0, -1.0),
                 ( 1.0, -1.0),
@@ -467,7 +500,6 @@ class YUVOpenGLWidget(QOpenGLWidget):
             self._program.enableAttributeArray(loc_v)
             self._program.enableAttributeArray(loc_t)
             
-            # Pass list of tuples directly. No tuple size argument needed for this overload.
             self._program.setAttributeArray(loc_v, vertices)
             self._program.setAttributeArray(loc_t, texCoords)
             
@@ -651,11 +683,13 @@ class Player(QMainWindow):
         
         self._render_w = 0
         self._render_h = 0
-        self._dw = 0 # FIX: Initialize _dw
-        self._dh = 0 # FIX: Initialize _dh
+        self._dw = 0
+        self._dh = 0
         self._sub_mode = "off"
         self._sub_ext_path = None
         self._sub_stream_idx = -1
+        self._sub_data = None
+        self._mem_sub_server = None
 
         if not self._ff:
             print(_L[self._lang]["noff"])
@@ -840,7 +874,8 @@ class Player(QMainWindow):
         msub.addSeparator()
         if self._info and self._info.get("subs"):
             for sub in self._info["subs"]:
-                self._add_action(msub, sub["label"], lambda idx=sub["stream_idx"]: self._sub_embed(idx))
+                # FIX: Accept the boolean signal argument (_) to prevent it from overriding the default idx
+                self._add_action(msub, sub["label"], lambda _, idx=sub["stream_idx"]: self._sub_embed(idx))
             msub.addSeparator()
         self._add_action(msub, S("sub_ext"), self._sub_load_ext)
 
@@ -906,14 +941,49 @@ class Player(QMainWindow):
             self._sub_mode = "off"
             self._sub_ext_path = None
             self._sub_stream_idx = -1
+            self._sub_data = None
             if self._playing: self._start(self._ct)
 
     def _sub_embed(self, stream_idx):
-        self._sub_mode = "embed"
-        self._sub_stream_idx = stream_idx
-        self._sub_ext_path = None
-        if self._playing: self._start(self._ct)
-        elif self._paused: self._grab_frame(self._ct)
+        # Extract subtitle to memory to avoid file locking/freezing issues
+        self._kill()
+        self._cv.set_text(self._S("sub_extracting"))
+        QApplication.processEvents()
+        
+        # Determine format based on codec
+        sub_info = next((s for s in self._info["subs"] if s["stream_idx"] == stream_idx), None)
+        codec = sub_info["codec"].lower() if sub_info else "ass"
+        
+        # Use copy for ASS/SSA to preserve styles and speed up extraction
+        # Use srt for others to ensure compatibility
+        if "ass" in codec or "ssa" in codec:
+            fmt = "ass"
+            extra_args = ["-c:s", "copy"]
+        else:
+            fmt = "srt"
+            extra_args = []
+
+        cmd = [self._ff, "-y", "-i", self._path, "-map", f"0:s:{stream_idx}", "-vn", "-an"] + extra_args + ["-f", fmt, "-"]
+        
+        try:
+            # Use Popen to capture stderr in case of failure
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **_pkw())
+            out, err = proc.communicate(timeout=30) # Increased timeout for large files
+            
+            if proc.returncode != 0 or not out:
+                err_msg = err.decode("utf-8", errors="ignore")[-500:] # Last 500 chars
+                self._alert(self._S("sub_fail").format(err_msg))
+                self._sub_mode = "off"
+            else:
+                self._sub_data = out
+                self._sub_mode = "mem"
+                self._sub_stream_idx = stream_idx
+                self._sub_ext_path = None
+        except Exception as e:
+            self._alert(self._S("sub_fail").format(str(e)))
+            self._sub_mode = "off"
+        
+        self._start(self._ct)
 
     def _sub_load_ext(self):
         p, _ = QFileDialog.getOpenFileName(self, self._S("sub_ext"), "", "Subtitle (*.srt *.ass *.ssa *.vtt);;All (*.*)")
@@ -921,6 +991,7 @@ class Player(QMainWindow):
             self._sub_mode = "ext"
             self._sub_ext_path = p
             self._sub_stream_idx = -1
+            self._sub_data = None
             if self._playing: self._start(self._ct)
             elif self._paused: self._grab_frame(self._ct)
 
@@ -930,9 +1001,13 @@ class Player(QMainWindow):
     def _build_vf_filter(self):
         parts = []
         # Subtitles
-        if self._sub_mode == "embed" and self._sub_stream_idx >= 0:
-            safe_path = self._escape_filter_path(self._path)
-            parts.append(f"subtitles=filename='{safe_path}':stream_index={self._sub_stream_idx}")
+        if self._sub_mode == "mem" and self._sub_data:
+            # Serve from memory via local TCP
+            self._mem_sub_server = MemSubServer(self._sub_data)
+            self._mem_sub_server.start()
+            port = self._mem_sub_server.port
+            url = f"tcp://127.0.0.1:{port}"
+            parts.append(f"subtitles=filename='{url}'")
         elif self._sub_mode == "ext" and self._sub_ext_path:
             safe_path = self._escape_filter_path(self._sub_ext_path)
             parts.append(f"subtitles=filename='{safe_path}'")
@@ -945,6 +1020,10 @@ class Player(QMainWindow):
     def _open_video(self, path):
         self._do_close()
         if not self._fp: return
+        
+        # Ensure absolute path to avoid relative path issues with subprocess
+        path = os.path.abspath(path)
+        
         info = _probe(self._fp, path)
         if info is None:
             self._alert(self._S("eo").format(path))
@@ -958,8 +1037,8 @@ class Player(QMainWindow):
         self._sub_mode = "off"
         self._sub_ext_path = None
         self._sub_stream_idx = -1
+        self._sub_data = None
         
-        # FIX: Calculate display width/height for drag preview
         w, h = info["width"], info["height"]
         if h > 1080:
             w = int(w * 1080 / h)
@@ -1191,6 +1270,7 @@ class Player(QMainWindow):
         self._sub_mode = "off"
         self._sub_ext_path = None
         self._sub_stream_idx = -1
+        self._sub_data = None
         self.setWindowTitle(self._S("title"))
         self._show_hint()
 
@@ -1390,7 +1470,12 @@ class Player(QMainWindow):
         ver_line = "unknown"
         try: ver_line = _run_text([self._ff, "-version"], timeout=5).split("\n")[0]
         except: pass
-        txt = self._S("abt") + f"\n\n{ver_line}"
+        
+        ff_path_str = self._S("ff_path").format(self._ff)
+        safe_desc = self._S("safe_desc")
+        
+        txt = f"{self._S('abt')}\n\n{safe_desc}\n\n{ver_line}\n{ff_path_str}"
+        
         lbl = QLabel(txt)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setWordWrap(True)
