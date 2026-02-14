@@ -203,6 +203,12 @@ def _run_text(cmd, timeout=15):
         return r.stdout.decode("utf-8", errors="ignore")
     except: return ""
 
+def _run_bin(cmd, timeout=15):
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, **_pkw())
+        return r.stdout
+    except: return b""
+
 def _probe(ffprobe, path):
     txt = _run_text([ffprobe, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path], timeout=15)
     if not txt: return None
@@ -820,7 +826,7 @@ class Player(QMainWindow):
         self._add_action(mp, S("nf"), self._next_frame, ".")
         mp.addSeparator()
         msp = mp.addMenu(S("spd"))
-        for s in self.SPEEDS: self._add_action(msp, f"{s}x", lambda v=s: self._set_speed(v))
+        for s in self.SPEEDS: self._add_action(msp, f"{s}x", lambda _, v=s: self._set_speed(v))
         mp.addSeparator()
         self._add_action(mp, S("fs"), self._toggle_fs, "F")
 
@@ -850,9 +856,9 @@ class Player(QMainWindow):
         mhw = ms.addMenu(S("hw"))
         self._add_action(mhw, S("hwa"), lambda: self._set_hw("auto"))
         self._add_action(mhw, S("hwd"), lambda: self._set_hw("off"))
-        for a in _hwaccels(self._ff): self._add_action(mhw, a, lambda v=a: self._set_hw(v))
+        for a in _hwaccels(self._ff): self._add_action(mhw, a, lambda _, v=a: self._set_hw(v))
         mop = ms.addMenu(S("opa"))
-        for p in (100, 90, 80, 70, 60, 50, 40, 30): self._add_action(mop, f"{p}%", lambda v=p: self._set_opacity(v))
+        for p in (100, 90, 80, 70, 60, 50, 40, 30): self._add_action(mop, f"{p}%", lambda _, v=p: self._set_opacity(v))
         mh = mb.addMenu(S("help"))
         self._add_action(mh, S("about"), self._about)
 
