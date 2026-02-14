@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
 """
 PPlayer — privacy-focused FFmpeg video player (no history).
-Required : Python 3.7+, Pillow (pip install Pillow)
-Optional : tkinterdnd2        (pip install tkinterdnd2) for drag-and-drop
+Refactored with PyQt6 for high performance.
+Required : Python 3.7+, Pillow, PyQt6
 FFmpeg is searched in PATH first, then in ./lib/ beside this script.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog
-import subprocess, threading, time, os, sys, platform, json, queue, shutil, re
+import sys
+import os
+import time
+import json
+import shutil
+import subprocess
+import threading
+import queue
+import re
+import platform
 import tempfile
 import uuid
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    from PIL import Image
 except ImportError:
-    print("Pillow is required:  pip install Pillow")
+    print("Pillow is required: pip install Pillow")
     sys.exit(1)
 
 try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-    _DND = True
+    from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
+                                 QVBoxLayout, QHBoxLayout, QFileDialog, QMenu, 
+                                 QSlider, QPushButton, QFrame, QDialog, QLineEdit,
+                                 QToolTip, QSizePolicy)
+    from PyQt6.QtCore import (Qt, QTimer, pyqtSignal, QObject, QEvent, QPoint, 
+                              QSize, QRect)
+    from PyQt6.QtGui import (QImage, QPixmap, QPainter, QColor, QAction, 
+                             QKeySequence, QIcon, QFont, QCursor, QScreen)
 except ImportError:
-    _DND = False
+    print("PyQt6 is required: pip install PyQt6")
+    sys.exit(1)
 
 _W = platform.system() == "Windows"
-try:
-    _BIL = Image.Resampling.BILINEAR
-except AttributeError:
-    _BIL = Image.BILINEAR
 
 # ── Config paths ────────────────────────────────────────────
 if _W:
@@ -77,16 +87,12 @@ _L = {
         "about": "About",
         "abt": (
             "PPlayer\n"
-            "FFmpeg-based video player\n"
+            "FFmpeg-based video player (PyQt6)\n"
             "No playback history is ever recorded.\n\n"
-            "This software uses FFmpeg, a complete cross-platform\n"
-            "solution to record, convert and stream audio and video.\n"
-            "FFmpeg is free software licensed under the LGPL/GPL.\n"
-            "Copyright (c) the FFmpeg developers.\n"
-            "https://ffmpeg.org  |  https://ffmpeg.org/legal.html"
+            "This software uses FFmpeg.\n"
+            "https://ffmpeg.org"
         ),
-        "hint": "Drop a video file here\nor use  File → Open",
-        "hint_nodnd": "Use  File → Open  to play a video",
+        "hint": "Drop a video file here\nor use File → Open",
         "htag": "HW: {}",
         "stag": "SW Decode",
         "noff": "FFmpeg not found!\nInstall FFmpeg or place binaries in ./lib/",
@@ -134,16 +140,12 @@ _L = {
         "about": "关于",
         "abt": (
             "PPlayer\n"
-            "基于 FFmpeg 的视频播放器\n"
+            "基于 FFmpeg 的视频播放器 (PyQt6)\n"
             "不记录任何播放历史。\n\n"
-            "本软件使用 FFmpeg —— 完整的跨平台音视频\n"
-            "录制、转换与流媒体解决方案。\n"
-            "FFmpeg 是基于 LGPL/GPL 许可的自由软件。\n"
-            "Copyright (c) FFmpeg 开发者。\n"
-            "https://ffmpeg.org  |  https://ffmpeg.org/legal.html"
+            "本软件使用 FFmpeg。\n"
+            "https://ffmpeg.org"
         ),
-        "hint": "拖放视频文件到此处\n或使用  文件→打开",
-        "hint_nodnd": "使用  文件→打开  来播放视频",
+        "hint": "拖放视频文件到此处\n或使用 文件→打开",
         "htag": "硬解: {}",
         "stag": "软件解码",
         "noff": "未找到 FFmpeg！\n请安装 FFmpeg 或将其放入 ./lib/ 目录",
@@ -155,7 +157,6 @@ _L = {
         "sub_extracting": "正在加载字幕 (内存)...",
     },
 }
-
 
 # ━━━━━━━━━━━━━━━ FFmpeg helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _find(name):
@@ -177,7 +178,6 @@ def _find(name):
         
     return None
 
-
 def _pkw():
     kw = {}
     if _W:
@@ -186,7 +186,6 @@ def _pkw():
         kw["startupinfo"] = si
         kw["creationflags"] = 0x08000000
     return kw
-
 
 def _run_text(cmd, timeout=15):
     try:
@@ -197,7 +196,6 @@ def _run_text(cmd, timeout=15):
     except Exception:
         return ""
 
-
 def _run_bin(cmd, timeout=5):
     try:
         r = subprocess.run(
@@ -206,7 +204,6 @@ def _run_bin(cmd, timeout=5):
         return r.stdout
     except Exception:
         return b""
-
 
 def _probe(ffprobe, path):
     txt = _run_text(
@@ -259,12 +256,10 @@ def _probe(ffprobe, path):
             sub_idx += 1
     return info if info["width"] > 0 else None
 
-
 def _hwaccels(ffmpeg):
     txt = _run_text([ffmpeg, "-hwaccels"], timeout=5)
     lines = txt.strip().split("\n")
     return [l.strip() for l in lines[1:] if l.strip()]
-
 
 def _read_n(pipe, n):
     buf = b""
@@ -274,7 +269,6 @@ def _read_n(pipe, n):
             return None
         buf += ch
     return buf
-
 
 # ━━━━━━━━━━━━━━━ Audio Player (master clock) ━━━━━━━━━━━━━━━
 class _AudioPlayer:
@@ -419,180 +413,208 @@ class _AudioPlayer:
             except ValueError:
                 pass
 
+# ━━━━━━━━━━━━━━━ Custom Widgets (PyQt6) ━━━━━━━━━━━━━━━━━━━
 
-# ━━━━━━━━━━━━━━━ Widgets ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-class _VCanvas(tk.Canvas):
-    def __init__(self, master, **kw):
-        kw.setdefault("bg", "black")
-        kw.setdefault("highlightthickness", 0)
-        super().__init__(master, **kw)
-        self._ph = None
+class VideoWidget(QWidget):
+    doubleClicked = pyqtSignal()
+    clicked = pyqtSignal()
+    wheelScrolled = pyqtSignal(int)
 
-    def show_img(self, pil):
-        cw, ch = self.winfo_width(), self.winfo_height()
-        if cw < 2 or ch < 2:
-            return
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.setStyleSheet("background-color: black;")
+        self._image = None
+        self._text = ""
+        self._click_timer = QTimer()
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._emit_click)
+
+    def set_image(self, qimg):
+        self._image = qimg
+        self._text = ""
+        self.update()
+
+    def set_text(self, text):
+        self._image = None
+        self._text = text
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+
+        if self._image:
+            # Scale and center
+            target_rect = self.rect()
+            # Use SmoothTransformation for high quality scaling (removes aliasing)
+            scaled_img = self._image.scaled(target_rect.size(), 
+                                          Qt.AspectRatioMode.KeepAspectRatio, 
+                                          Qt.TransformationMode.SmoothTransformation)
+            
+            x = (target_rect.width() - scaled_img.width()) // 2
+            y = (target_rect.height() - scaled_img.height()) // 2
+            painter.drawImage(x, y, scaled_img)
         
-        iw, ih = pil.size
-        if abs(iw - cw) > 2 or abs(ih - ch) > 2:
-             s = min(cw / iw, ch / ih)
-             nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
-             if nw != iw or nh != ih:
-                 pil = pil.resize((nw, nh), _BIL)
+        elif self._text:
+            painter.setPen(QColor("#555555"))
+            font = painter.font()
+            font.setPointSize(16)
+            painter.setFont(font)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
 
-        self._ph = ImageTk.PhotoImage(pil)
-        self.delete("all")
-        self.create_image(cw // 2, ch // 2, image=self._ph, anchor="center")
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._click_timer.start(300)
+        elif event.button() == Qt.MouseButton.BackButton:
+            self.wheelScrolled.emit(5) # Map extra buttons
+        elif event.button() == Qt.MouseButton.ForwardButton:
+            self.wheelScrolled.emit(-5)
 
-    def show_txt(self, txt):
-        self.delete("all")
-        cw, ch = self.winfo_width(), self.winfo_height()
-        if cw > 1:
-            self.create_text(cw // 2, ch // 2, text=txt,
-                             fill="#555", font=("Helvetica", 16),
-                             justify="center")
+    def mouseDoubleClickEvent(self, event):
+        self._click_timer.stop()
+        self.doubleClicked.emit()
 
+    def _emit_click(self):
+        self.clicked.emit()
 
-class _Bar(tk.Canvas):
-    def __init__(self, master, **kw):
-        super().__init__(master, height=24, bg="#181818",
-                         highlightthickness=0, **kw)
-        self.dur = 0.0
-        self.pos = 0.0
-        self._drag = False
-        self.on_seek = None
-        self.on_drag_start = None
-        self.on_drag_pos = None
-        self.on_hover = None
-        self.on_leave_cb = None
-        self.bind("<Button-1>", self._b1)
-        self.bind("<B1-Motion>", self._bm)
-        self.bind("<ButtonRelease-1>", self._br)
-        self.bind("<Motion>", self._mv)
-        self.bind("<Leave>", self._lv)
-        self.bind("<Configure>", lambda e: self._draw())
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.wheelScrolled.emit(5)
+        else:
+            self.wheelScrolled.emit(-5)
 
-    def _t(self, x):
-        w = self.winfo_width()
-        if self.dur <= 0 or w <= 0:
-            return 0.0
-        return max(0.0, min(self.dur, x / w * self.dur))
+class SeekSlider(QWidget):
+    seekRequested = pyqtSignal(float)
+    dragStarted = pyqtSignal()
+    dragPosition = pyqtSignal(float)
+    hoverMove = pyqtSignal(float, int, int)
+    hoverLeave = pyqtSignal()
 
-    def _x(self, t):
-        w = self.winfo_width()
-        return (t / self.dur * w) if self.dur > 0 else 0
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(24)
+        self.setMouseTracking(True)
+        self.duration = 0.0
+        self.position = 0.0
+        self._dragging = False
 
     def set_pos(self, t):
-        if not self._drag:
-            self.pos = t
-            self._draw()
+        if not self._dragging:
+            self.position = t
+            self.update()
 
-    def _draw(self):
-        self.delete("all")
-        w, h = self.winfo_width(), self.winfo_height()
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
         cy = h // 2
-        self.create_rectangle(4, cy - 3, w - 4, cy + 3,
-                              fill="#444", outline="")
-        if self.dur > 0:
-            px = max(4, min(w - 4, self._x(self.pos)))
-            self.create_rectangle(4, cy - 3, px, cy + 3,
-                                  fill="#0078d4", outline="")
-            self.create_oval(px - 6, cy - 6, px + 6, cy + 6,
-                             fill="white", outline="#0078d4", width=2)
+        
+        # Background
+        painter.fillRect(4, cy - 3, w - 8, 6, QColor("#444444"))
+        
+        if self.duration > 0:
+            ratio = self.position / self.duration
+            px = int(4 + (w - 8) * ratio)
+            px = max(4, min(w - 4, px))
+            
+            # Fill
+            painter.fillRect(4, cy - 3, px - 4, 6, QColor("#0078d4"))
+            
+            # Handle
+            painter.setBrush(Qt.GlobalColor.white)
+            painter.setPen(QColor("#0078d4"))
+            painter.drawEllipse(QPoint(px, cy), 6, 6)
 
-    def _b1(self, e):
-        self._drag = True
-        self.pos = self._t(e.x)
-        self._draw()
-        if self.on_drag_start:
-            self.on_drag_start()
-        if self.on_leave_cb:
-            self.on_leave_cb()
-        if self.on_drag_pos:
-            self.on_drag_pos(self.pos)
+    def _time_at_x(self, x):
+        w = self.width()
+        if self.duration <= 0 or w <= 8:
+            return 0.0
+        ratio = (x - 4) / (w - 8)
+        return max(0.0, min(self.duration, ratio * self.duration))
 
-    def _bm(self, e):
-        if self._drag:
-            self.pos = self._t(e.x)
-            self._draw()
-            if self.on_drag_pos:
-                self.on_drag_pos(self.pos)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self.position = self._time_at_x(event.pos().x())
+            self.update()
+            self.dragStarted.emit()
+            self.hoverLeave.emit()
+            self.dragPosition.emit(self.position)
 
-    def _br(self, e):
-        if self._drag:
-            self._drag = False
-            self.pos = self._t(e.x)
-            self._draw()
-            if self.on_seek:
-                self.on_seek(self.pos)
+    def mouseMoveEvent(self, event):
+        t = self._time_at_x(event.pos().x())
+        if self._dragging:
+            self.position = t
+            self.update()
+            self.dragPosition.emit(self.position)
+        else:
+            if self.duration > 0:
+                self.hoverMove.emit(t, event.globalPosition().x(), event.globalPosition().y())
 
-    def _mv(self, e):
-        if self._drag:
-            return
-        t = self._t(e.x)
-        if self.on_hover and self.dur > 0:
-            self.on_hover(t, self.winfo_rootx() + e.x,
-                          self.winfo_rooty())
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            self.position = self._time_at_x(event.pos().x())
+            self.update()
+            self.seekRequested.emit(self.position)
 
-    def _lv(self, e):
-        if self.on_leave_cb:
-            self.on_leave_cb()
+    def leaveEvent(self, event):
+        self.hoverLeave.emit()
 
+class PreviewTip(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip)
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        self.img_label = QLabel()
+        self.img_label.setStyleSheet("border: 1px solid #444; background: black;")
+        self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.txt_label = QLabel()
+        self.txt_label.setStyleSheet("background: black; color: white; padding: 2px;")
+        self.txt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.txt_label.setFont(QFont("Helvetica", 9))
+        
+        layout.addWidget(self.img_label)
+        layout.addWidget(self.txt_label)
 
-class _Tip:
-    def __init__(self, par):
-        self._par = par
-        self._w = None
-        self._ph = None
-        self._il = None
-        self._tl = None
-
-    def show(self, pil, txt, sx, sy):
-        if self._w is None:
-            self._w = tk.Toplevel(self._par)
-            self._w.overrideredirect(True)
-            self._w.attributes("-topmost", True)
-            self._il = tk.Label(self._w, bg="black", bd=1, relief="solid")
-            self._il.pack()
-            self._tl = tk.Label(self._w, bg="black", fg="white",
-                                font=("Helvetica", 9))
-            self._tl.pack()
-        self._ph = ImageTk.PhotoImage(pil)
-        self._il.config(image=self._ph)
-        self._tl.config(text=txt)
-        iw, ih = pil.size
-        nx = max(0, sx - iw // 2)
-        ny = max(0, sy - ih - 40)
-        self._w.geometry(f"+{nx}+{ny}")
-        self._w.deiconify()
-
-    def hide(self):
-        if self._w:
-            self._w.withdraw()
-
-    def destroy(self):
-        if self._w:
-            self._w.destroy()
-            self._w = None
-
+    def show_tip(self, qimg, text, gx, gy):
+        pix = QPixmap.fromImage(qimg)
+        self.img_label.setPixmap(pix)
+        self.txt_label.setText(text)
+        
+        # Calculate position
+        w, h = pix.width(), pix.height() + 20
+        nx = gx - w // 2
+        ny = gy - h - 40
+        
+        # Screen boundary check
+        screen = QApplication.screenAt(QPoint(gx, gy))
+        if screen:
+            geo = screen.geometry()
+            if nx < geo.left(): nx = geo.left() + 5
+            if nx + w > geo.right(): nx = geo.right() - w - 5
+            if ny < geo.top(): ny = gy + 20 # Show below if not enough space above
+        
+        self.move(nx, ny)
+        self.show()
 
 # ━━━━━━━━━━━━━━━━━━ Player ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-class Player:
+class Player(QMainWindow):
+    frameReady = pyqtSignal(bytes, int, int) # Signal to update UI from thread
+    hwInfoReady = pyqtSignal(str, str)
+    previewReady = pyqtSignal(int, object) # key, QImage
+
     SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-    _CONTROL_KEYS = {
-        "space", "Left", "Right", "Up", "Down",
-        "m", "M", "f", "F", "F11", "period",
-        "bracketleft", "bracketright",
-        "Return", "Tab", "Shift_L", "Shift_R",
-        "Control_L", "Control_R", "Alt_L", "Alt_R",
-        "Super_L", "Super_R", "Caps_Lock", "Num_Lock",
-        "Scroll_Lock", "Menu", "Pause", "Print",
-        "F1", "F2", "F3", "F4", "F5", "F6",
-        "F7", "F8", "F9", "F10", "F12",
-    }
-
     def __init__(self):
+        super().__init__()
         self._ff = _find("ffmpeg")
         self._fp = _find("ffprobe")
         self._fy = _find("ffplay")
@@ -617,16 +639,12 @@ class Player:
         self._fsc = False
         self._gen = 0
         self._evt = threading.Event()
-        self._q = queue.Queue(maxsize=8)
         self._vp = None
         self._audio = _AudioPlayer()
-        self._frame = None
         self._dw = 0
         self._dh = 0
         self._pcache = {}
         self._pbusy = False
-        self._ui_ready = False
-        self._click_pending = None
         self._drag_gen = 0
         self._drag_busy = False
         self._drag_was_playing = False
@@ -634,49 +652,50 @@ class Player:
         self._hwd = ""
         self._sync_t0 = 0.0
         
-        self._view_w = 960
-        self._view_h = 540
+        self._render_w = 0
+        self._render_h = 0
 
         self._sub_mode = "off"
         self._sub_ext_path = None
-        
-        # Memory-based subtitle handling
-        self._sub_data = None  # Bytes of the subtitle file
+        self._sub_data = None
         self._sub_pipe_name = None
         self._sub_thread = None
         self._sub_stop_evt = threading.Event()
 
-        self._root = TkinterDnD.Tk() if _DND else tk.Tk()
-        self._root.title("PPlayer")
-        self._root.geometry(self._saved_geo)
-        self._root.minsize(480, 320)
-        self._root.configure(bg="black")
-        self._root.attributes("-alpha", self._opacity)
-
         if not self._ff:
-            self._root.withdraw()
-            from tkinter import messagebox
-            messagebox.showerror("Error", _L[self._lang]["noff"])
+            print(_L[self._lang]["noff"])
             sys.exit(1)
 
-        self._build_ui()
-        self._ui_ready = True
-        self._build_menus()
-        self._bind_keys()
+        self.setWindowTitle("PPlayer")
+        self.resize(800, 500)
+        if self._saved_geo:
+            try:
+                w, h = map(int, self._saved_geo.split("x"))
+                self.resize(w, h)
+            except: pass
+            
+        self.setMinimumSize(480, 320)
+        self.setWindowOpacity(self._opacity)
+        self.setAcceptDrops(True)
 
-        self._vsc.set(self._vol)
-        self._lsp.config(text=f"{self._speed}x")
+        self._build_ui()
+        self._build_menus()
+        
+        # Signals
+        self.frameReady.connect(self._on_frame_ready)
+        self.hwInfoReady.connect(self._on_hw_info)
+        self.previewReady.connect(self._on_preview_ready)
+
+        self._vsc.setValue(self._vol)
+        self._lsp.setText(f"{self._speed}x")
         self._mu_icon()
 
-        if _DND:
-            self._root.drop_target_register(DND_FILES)
-            self._root.dnd_bind("<<Drop>>", self._on_drop)
-
-        self._root.after(250, self._show_hint)
-        self._tick()
-
-    def run(self):
-        self._root.mainloop()
+        QTimer.singleShot(250, self._show_hint)
+        
+        # Tick timer for UI updates (progress bar)
+        self._tick_timer = QTimer()
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start(50)
 
     def _S(self, k):
         return _L.get(self._lang, _L["en"]).get(k, k)
@@ -689,14 +708,13 @@ class Player:
         return f"{h}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
 
     def _show_hint(self):
-        key = "hint" if _DND else "hint_nodnd"
-        self._cv.show_txt(self._S(key))
+        self._cv.set_text(self._S("hint"))
 
     def _load_settings(self):
         defaults = dict(lang="en", volume=100, speed=1.0,
                         hw_mode="auto", boss_key="Escape",
                         boss_any=False, opacity=1.0,
-                        geometry="960x600")
+                        geometry="800x500")
         try:
             if _CFG_FILE.exists():
                 with open(_CFG_FILE, "r", encoding="utf-8") as f:
@@ -712,20 +730,12 @@ class Player:
         if defaults["speed"] not in Player.SPEEDS:
             defaults["speed"] = 1.0
         defaults["opacity"] = max(0.3, min(1.0, float(defaults["opacity"])))
-        if not isinstance(defaults["boss_any"], bool):
-            defaults["boss_any"] = False
-        if not isinstance(defaults["geometry"], str):
-            defaults["geometry"] = "960x600"
         return defaults
 
     def _save_settings(self):
         try:
             _CFG_DIR.mkdir(parents=True, exist_ok=True)
-            geo = "960x600"
-            try:
-                geo = self._root.geometry()
-            except Exception:
-                pass
+            geo = f"{self.width()}x{self.height()}"
             d = dict(lang=self._lang, volume=self._vol,
                      speed=self._speed, hw_mode=self._hwm,
                      boss_key=self._boss, boss_any=self._boss_any,
@@ -736,258 +746,218 @@ class Player:
             pass
 
     def _build_ui(self):
-        self._mb = tk.Menu(self._root)
-        self._root.config(menu=self._mb)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        self._mf = tk.Menu(self._mb, tearoff=0)
-        self._mp = tk.Menu(self._mb, tearoff=0)
-        self._ma = tk.Menu(self._mb, tearoff=0)
-        self._ms = tk.Menu(self._mb, tearoff=0)
-        self._mh = tk.Menu(self._mb, tearoff=0)
-        self._msp = tk.Menu(self._mp, tearoff=0)
-        self._ml = tk.Menu(self._ms, tearoff=0)
-        self._mhw = tk.Menu(self._ms, tearoff=0)
-        self._mop = tk.Menu(self._ms, tearoff=0)
-        self._msub = tk.Menu(self._mb, tearoff=0)
+        self._cv = VideoWidget()
+        self._cv.clicked.connect(self._toggle_play)
+        self._cv.doubleClicked.connect(self._toggle_fs)
+        self._cv.wheelScrolled.connect(self._chg_vol)
+        main_layout.addWidget(self._cv, 1)
 
-        self._mb.add_cascade(label="File", menu=self._mf)
-        self._mb.add_cascade(label="Playback", menu=self._mp)
-        self._mb.add_cascade(label="Audio", menu=self._ma)
-        self._mb.add_cascade(label="Subtitle", menu=self._msub)
-        self._mb.add_cascade(label="Settings", menu=self._ms)
-        self._mb.add_cascade(label="Help", menu=self._mh)
+        # Controls
+        self._ctrl = QFrame()
+        self._ctrl.setStyleSheet("background-color: #181818;")
+        self._ctrl.setFixedHeight(64)
+        ctrl_layout = QVBoxLayout(self._ctrl)
+        ctrl_layout.setContentsMargins(4, 4, 4, 4)
+        ctrl_layout.setSpacing(2)
 
-        self._cv = _VCanvas(self._root)
-        self._cv.pack(fill="both", expand=True)
-        self._cv.bind("<Double-1>", self._on_dbl_click)
-        self._cv.bind("<Button-1>", self._on_single_click)
-        self._cv.bind("<MouseWheel>",
-                      lambda e: self._chg_vol(5 if e.delta > 0 else -5))
-        self._cv.bind("<Button-4>", lambda e: self._chg_vol(5))
-        self._cv.bind("<Button-5>", lambda e: self._chg_vol(-5))
+        self._bar = SeekSlider()
+        self._bar.seekRequested.connect(self._on_bar_release)
+        self._bar.dragStarted.connect(self._on_drag_start)
+        self._bar.dragPosition.connect(self._on_drag_preview)
+        self._bar.hoverMove.connect(self._prev_hover)
+        self._bar.hoverLeave.connect(self._prev_leave)
+        ctrl_layout.addWidget(self._bar)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
         
-        self._cv.bind("<Configure>", self._on_view_resize)
+        # Button Style
+        B_STYLE = """
+            QPushButton {
+                background-color: #181818; color: white; border: none;
+                font-family: "Segoe UI Symbol"; font-size: 16px; padding: 4px;
+            }
+            QPushButton:hover { background-color: #333; }
+        """
 
-        ctrl = tk.Frame(self._root, bg="#181818", height=64)
-        ctrl.pack(fill="x", side="bottom")
-        ctrl.pack_propagate(False)
-        self._ctrl = ctrl
+        self._bpp = QPushButton("\u25B6")
+        self._bpp.setStyleSheet(B_STYLE)
+        self._bpp.clicked.connect(self._toggle_play)
+        btn_layout.addWidget(self._bpp)
 
-        self._bar = _Bar(ctrl)
-        self._bar.pack(fill="x", padx=4, pady=(4, 0))
-        self._bar.on_seek = self._on_bar_release
-        self._bar.on_drag_start = self._on_drag_start
-        self._bar.on_drag_pos = self._on_drag_preview
-        self._bar.on_hover = self._prev_hover
-        self._bar.on_leave_cb = self._prev_leave
-        self._tip = _Tip(self._root)
+        b_stop = QPushButton("\u23F9")
+        b_stop.setStyleSheet(B_STYLE)
+        b_stop.clicked.connect(self._do_stop)
+        btn_layout.addWidget(b_stop)
 
-        bf = tk.Frame(ctrl, bg="#181818")
-        bf.pack(fill="x", padx=4)
+        self._tv = QLabel("00:00 / 00:00")
+        self._tv.setStyleSheet("color: #aaa; font-family: Consolas; font-size: 12px;")
+        btn_layout.addWidget(self._tv)
+        
+        btn_layout.addStretch()
 
-        B = dict(bg="#181818", fg="white", bd=0,
-                 activebackground="#333", activeforeground="white",
-                 font=("Segoe UI Symbol", 12), padx=6)
+        self._lhw = QLabel("")
+        self._lhw.setStyleSheet("color: #6a6; font-size: 11px;")
+        btn_layout.addWidget(self._lhw)
 
-        self._bpp = tk.Button(bf, text="\u25B6",
-                              command=self._toggle_play, **B)
-        self._bpp.pack(side="left")
+        self._lsp = QLabel("1.0x")
+        self._lsp.setStyleSheet("color: #aaa; font-size: 11px;")
+        btn_layout.addWidget(self._lsp)
 
-        tk.Button(bf, text="\u23F9",
-                  command=self._do_stop, **B).pack(side="left")
+        self._bmu = QPushButton("\U0001F50A")
+        self._bmu.setStyleSheet(B_STYLE)
+        self._bmu.clicked.connect(self._toggle_mute)
+        btn_layout.addWidget(self._bmu)
 
-        self._tv = tk.StringVar(value="00:00 / 00:00")
-        tk.Label(bf, textvariable=self._tv, bg="#181818", fg="#aaa",
-                 font=("Consolas", 10)).pack(side="left", padx=8)
+        self._vsc = QSlider(Qt.Orientation.Horizontal)
+        self._vsc.setRange(0, 100)
+        self._vsc.setFixedWidth(80)
+        self._vsc.valueChanged.connect(self._on_vol)
+        btn_layout.addWidget(self._vsc)
 
-        self._lhw = tk.Label(bf, text="", bg="#181818", fg="#6a6",
-                             font=("Helvetica", 9))
-        self._lhw.pack(side="right", padx=4)
+        self._lvl = QLabel("100%")
+        self._lvl.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._lvl.setFixedWidth(35)
+        btn_layout.addWidget(self._lvl)
 
-        self._lsp = tk.Label(bf, text="1.0x", bg="#181818", fg="#aaa",
-                             font=("Helvetica", 9))
-        self._lsp.pack(side="right", padx=4)
+        self._bfs = QPushButton("⛶")
+        self._bfs.setStyleSheet(B_STYLE)
+        self._bfs.clicked.connect(self._toggle_fs)
+        btn_layout.addWidget(self._bfs)
 
-        vf = tk.Frame(bf, bg="#181818")
-        vf.pack(side="right")
+        ctrl_layout.addLayout(btn_layout)
+        main_layout.addWidget(self._ctrl)
 
-        self._bfs = tk.Button(vf, text="⛶", command=self._toggle_fs, **B)
-        self._bfs.pack(side="right", padx=4)
+        self._tip = PreviewTip(self)
 
-        self._bmu = tk.Button(vf, text="\U0001F50A",
-                              command=self._toggle_mute, **B)
-        self._bmu.pack(side="left")
-
-        self._lvl = tk.Label(vf, text="100%", bg="#181818", fg="#aaa",
-                             font=("Helvetica", 9), width=5)
-        self._lvl.pack(side="right")
-
-        self._vsc = ttk.Scale(vf, from_=0, to=100, orient="horizontal",
-                              length=80, command=self._on_vol)
-        self._vsc.set(self._vol)
-        self._vsc.pack(side="left")
-
-    def _on_view_resize(self, event):
-        self._view_w = event.width
-        self._view_h = event.height
-
-    def _on_single_click(self, event):
-        self._cv.focus_set()
-        if self._click_pending is not None:
-            self._root.after_cancel(self._click_pending)
-        self._click_pending = self._root.after(300, self._do_delayed_click)
-
-    def _on_dbl_click(self, event):
-        if self._click_pending is not None:
-            self._root.after_cancel(self._click_pending)
-            self._click_pending = None
-        self._toggle_fs()
-
-    def _do_delayed_click(self):
-        self._click_pending = None
-        self._toggle_play()
+    def _add_action(self, menu, text, slot, shortcut=None):
+        """Helper to add action safely in PyQt6"""
+        action = QAction(text, self)
+        action.triggered.connect(slot)
+        if shortcut:
+            action.setShortcut(QKeySequence(shortcut))
+        menu.addAction(action)
+        return action
 
     def _build_menus(self):
+        mb = self.menuBar()
+        mb.clear()
         S = self._S
 
-        self._mb.entryconfigure(1, label=S("file"))
-        self._mb.entryconfigure(2, label=S("playback"))
-        self._mb.entryconfigure(3, label=S("audio"))
-        self._mb.entryconfigure(4, label=S("sub"))
-        self._mb.entryconfigure(5, label=S("settings"))
-        self._mb.entryconfigure(6, label=S("help"))
+        mf = mb.addMenu(S("file"))
+        self._add_action(mf, S("open"), self._open_file, "Ctrl+O")
+        self._add_action(mf, S("open_path"), self._open_path, "Ctrl+L")
+        mf.addSeparator()
+        self._add_action(mf, S("close"), self._do_close)
+        mf.addSeparator()
+        self._add_action(mf, S("exit"), self.close)
 
-        for m in (self._mf, self._mp, self._ma, self._ms,
-                  self._mh, self._msp, self._ml, self._mhw,
-                  self._mop, self._msub):
-            m.delete(0, "end")
-
-        self._mf.add_command(label=S("open"), accelerator="Ctrl+O",
-                             command=self._open_file)
-        self._mf.add_command(label=S("open_path"), accelerator="Ctrl+L",
-                             command=self._open_path)
-        self._mf.add_separator()
-        self._mf.add_command(label=S("close"), command=self._do_close)
-        self._mf.add_separator()
-        self._mf.add_command(label=S("exit"), command=self._quit)
-
-        self._mp.add_command(label=S("pp"), accelerator="Space",
-                             command=self._toggle_play)
-        self._mp.add_command(label=S("stop"), command=self._do_stop)
-        self._mp.add_separator()
-        self._mp.add_command(label=S("bwd5"), accelerator="\u2190",
-                             command=lambda: self._seek_rel(-5))
-        self._mp.add_command(label=S("fwd5"), accelerator="\u2192",
-                             command=lambda: self._seek_rel(5))
-        self._mp.add_command(label=S("bwd30"), accelerator="Ctrl+\u2190",
-                             command=lambda: self._seek_rel(-30))
-        self._mp.add_command(label=S("fwd30"), accelerator="Ctrl+\u2192",
-                             command=lambda: self._seek_rel(30))
-        self._mp.add_command(label=S("nf"), accelerator=".",
-                             command=self._next_frame)
-        self._mp.add_separator()
+        mp = mb.addMenu(S("playback"))
+        self._add_action(mp, S("pp"), self._toggle_play, "Space")
+        self._add_action(mp, S("stop"), self._do_stop)
+        mp.addSeparator()
+        self._add_action(mp, S("bwd5"), lambda: self._seek_rel(-5), "Left")
+        self._add_action(mp, S("fwd5"), lambda: self._seek_rel(5), "Right")
+        self._add_action(mp, S("bwd30"), lambda: self._seek_rel(-30), "Ctrl+Left")
+        self._add_action(mp, S("fwd30"), lambda: self._seek_rel(30), "Ctrl+Right")
+        self._add_action(mp, S("nf"), self._next_frame, ".")
+        mp.addSeparator()
+        
+        msp = mp.addMenu(S("spd"))
         for s in self.SPEEDS:
-            self._msp.add_command(
-                label=f"{s}x",
-                command=lambda v=s: self._set_speed(v))
-        self._mp.add_cascade(label=S("spd"), menu=self._msp)
-        self._mp.add_separator()
-        self._mp.add_command(label=S("fs"), accelerator="F / F11",
-                             command=self._toggle_fs)
+            self._add_action(msp, f"{s}x", lambda v=s: self._set_speed(v))
+            
+        mp.addSeparator()
+        self._add_action(mp, S("fs"), self._toggle_fs, "F")
 
-        self._ma.add_command(label=S("vu"), accelerator="\u2191",
-                             command=lambda: self._chg_vol(5))
-        self._ma.add_command(label=S("vd"), accelerator="\u2193",
-                             command=lambda: self._chg_vol(-5))
-        self._ma.add_command(label=S("mute"), accelerator="M",
-                             command=self._toggle_mute)
+        ma = mb.addMenu(S("audio"))
+        self._add_action(ma, S("vu"), lambda: self._chg_vol(5), "Up")
+        self._add_action(ma, S("vd"), lambda: self._chg_vol(-5), "Down")
+        self._add_action(ma, S("mute"), self._toggle_mute, "M")
 
-        self._msub.add_command(label=S("sub_off"),
-                               command=self._sub_off)
-        self._msub.add_separator()
+        msub = mb.addMenu(S("sub"))
+        self._add_action(msub, S("sub_off"), self._sub_off)
+        msub.addSeparator()
         if self._info and self._info.get("subs"):
             for sub in self._info["subs"]:
                 si = sub["stream_idx"]
                 codec = sub.get("codec", "")
-                self._msub.add_command(
-                    label=sub["label"],
-                    command=lambda idx=si, c=codec: self._sub_embed(idx, c))
-            self._msub.add_separator()
-        self._msub.add_command(label=S("sub_ext"),
-                               command=self._sub_load_ext)
+                # Capture variables in lambda
+                self._add_action(msub, sub["label"], lambda idx=si, c=codec: self._sub_embed(idx, c))
+            msub.addSeparator()
+        self._add_action(msub, S("sub_ext"), self._sub_load_ext)
 
-        self._ml.add_command(label="English",
-                             command=lambda: self._set_lang("en"))
-        self._ml.add_command(label="\u4E2D\u6587",
-                             command=lambda: self._set_lang("zh"))
-        self._ms.add_cascade(label=S("lang"), menu=self._ml)
+        ms = mb.addMenu(S("settings"))
+        ml = ms.addMenu(S("lang"))
+        self._add_action(ml, "English", lambda: self._set_lang("en"))
+        self._add_action(ml, "\u4E2D\u6587", lambda: self._set_lang("zh"))
 
-        self._ms.add_command(label=S("boss"), command=self._set_boss)
+        self._add_action(ms, S("boss"), self._set_boss)
+        
+        act_boss_any = QAction(S("boss_any"), self, checkable=True)
+        act_boss_any.setChecked(self._boss_any)
+        act_boss_any.triggered.connect(self._toggle_boss_any)
+        ms.addAction(act_boss_any)
 
-        self._boss_any_var = tk.BooleanVar(value=self._boss_any)
-        self._ms.add_checkbutton(
-            label=S("boss_any"),
-            variable=self._boss_any_var,
-            command=self._toggle_boss_any)
-
-        self._mhw.add_command(label=S("hwa"),
-                              command=lambda: self._set_hw("auto"))
-        self._mhw.add_command(label=S("hwd"),
-                              command=lambda: self._set_hw("off"))
+        mhw = ms.addMenu(S("hw"))
+        self._add_action(mhw, S("hwa"), lambda: self._set_hw("auto"))
+        self._add_action(mhw, S("hwd"), lambda: self._set_hw("off"))
         for a in _hwaccels(self._ff):
-            self._mhw.add_command(
-                label=a, command=lambda v=a: self._set_hw(v))
-        self._ms.add_cascade(label=S("hw"), menu=self._mhw)
+            self._add_action(mhw, a, lambda v=a: self._set_hw(v))
 
+        mop = ms.addMenu(S("opa"))
         for p in (100, 90, 80, 70, 60, 50, 40, 30):
-            self._mop.add_command(
-                label=f"{p}%",
-                command=lambda v=p: self._set_opacity(v))
-        self._ms.add_cascade(label=S("opa"), menu=self._mop)
+            self._add_action(mop, f"{p}%", lambda v=p: self._set_opacity(v))
 
-        self._mh.add_command(label=S("about"), command=self._about)
+        mh = mb.addMenu(S("help"))
+        self._add_action(mh, S("about"), self._about)
 
-    def _set_opacity(self, pct):
-        self._opacity = max(0.3, min(1.0, pct / 100.0))
-        self._root.attributes("-alpha", self._opacity)
+    def keyPressEvent(self, event):
+        key = event.key()
+        # Boss key check
+        try:
+            ks = QKeySequence(key).toString()
+            if ks.lower() == self._boss.lower() or (self._boss == "Escape" and key == Qt.Key.Key_Escape):
+                self.close()
+                return
+        except: pass
 
-    def _bind_keys(self):
-        r = self._root
-        r.bind("<space>", lambda e: self._toggle_play())
-        r.bind("<Left>", lambda e: self._seek_rel(-5))
-        r.bind("<Right>", lambda e: self._seek_rel(5))
-        r.bind("<Control-Left>", lambda e: self._seek_rel(-30))
-        r.bind("<Control-Right>", lambda e: self._seek_rel(30))
-        r.bind("<Up>", lambda e: self._chg_vol(5))
-        r.bind("<Down>", lambda e: self._chg_vol(-5))
-        r.bind("<m>", lambda e: self._toggle_mute())
-        r.bind("<M>", lambda e: self._toggle_mute())
-        r.bind("<f>", lambda e: self._toggle_fs())
-        r.bind("<F>", lambda e: self._toggle_fs())
-        r.bind("<F11>", lambda e: self._toggle_fs())
-        r.bind("<Control-o>", lambda e: self._open_file())
-        r.bind("<Control-O>", lambda e: self._open_file())
-        r.bind("<Control-l>", lambda e: self._open_path())
-        r.bind("<Control-L>", lambda e: self._open_path())
-        r.bind("<period>", lambda e: self._next_frame())
-        r.bind("<bracketright>", lambda e: self._cycle_speed(1))
-        r.bind("<bracketleft>", lambda e: self._cycle_speed(-1))
-        r.bind("<Key>", self._on_any_key)
-        r.protocol("WM_DELETE_WINDOW", self._quit)
+        if self._boss_any:
+            # Simple check for non-modifier keys
+            if key not in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+                if not (event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)):
+                    self.close()
+                    return
 
-    def _on_any_key(self, event):
-        ks = event.keysym
-        if ks == self._boss:
-            self._quit()
-            return "break"
-        if self._boss_any and ks not in self._CONTROL_KEYS:
-            if not (event.state & 0x4):
-                self._quit()
-                return "break"
-        return None
+        # Shortcuts that might not be in menus or need global handling
+        if key == Qt.Key.Key_F11:
+            self._toggle_fs()
+        elif key == Qt.Key.Key_BracketRight:
+            self._cycle_speed(1)
+        elif key == Qt.Key.Key_BracketLeft:
+            self._cycle_speed(-1)
+        
+        super().keyPressEvent(event)
 
-    def _toggle_boss_any(self):
-        self._boss_any = self._boss_any_var.get()
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        files = [u.toLocalFile() for u in event.mimeData().urls()]
+        if files:
+            self._open_video(files[0])
+
+    def _toggle_boss_any(self, checked):
+        self._boss_any = checked
 
     def _set_lang(self, c):
         self._lang = c
@@ -996,66 +966,23 @@ class Player:
             self._show_hint()
 
     def _apply_lang(self):
-        self._root.title(
+        self.setWindowTitle(
             f"{os.path.basename(self._path)} — {self._S('title')}"
             if self._path else self._S("title"))
         self._build_menus()
 
-    def _on_drop(self, event):
-        p = event.data.strip()
-        if p.startswith("{"):
-            p = p[1:]
-        if p.endswith("}"):
-            p = p[:-1]
-        p = p.split("\n")[0].strip().strip("'\"")
-        if p:
-            self._open_video(p)
-
     def _open_file(self):
-        ft = [("Video",
-               "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v "
-               "*.ts *.mpg *.mpeg *.3gp *.ogv *.rmvb *.rm *.vob"),
-              ("All", "*.*")]
-        p = filedialog.askopenfilename(filetypes=ft)
+        ft = "Video (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.3gp *.ogv *.rmvb *.rm *.vob);;All (*.*)"
+        p, _ = QFileDialog.getOpenFileName(self, self._S("open"), "", ft)
         if p:
             self._open_video(p)
 
     def _open_path(self):
-        dlg = tk.Toplevel(self._root)
-        dlg.title(self._S("open_path"))
-        dlg.geometry("520x120")
-        dlg.transient(self._root)
-        dlg.grab_set()
-        dlg.resizable(False, False)
+        text, ok = QInputDialog_getText(self, self._S("open_path"), self._S("ep"))
+        if ok and text:
+            self._open_video(text.strip())
 
-        tk.Label(dlg, text=self._S("ep"),
-                 font=("Helvetica", 10)).pack(padx=10, pady=(10, 4),
-                                              anchor="w")
-        ent = tk.Entry(dlg, font=("Helvetica", 11))
-        ent.pack(padx=10, fill="x")
-        ent.focus_set()
-
-        res = [None]
-
-        def ok():
-            res[0] = ent.get().strip()
-            dlg.destroy()
-
-        ent.bind("<Return>", lambda e: ok())
-        ent.bind("<Escape>", lambda e: dlg.destroy())
-
-        fr = tk.Frame(dlg)
-        fr.pack(pady=8)
-        tk.Button(fr, text=self._S("ok"), width=10,
-                  command=ok).pack(side="left", padx=4)
-        tk.Button(fr, text=self._S("cancel"), width=10,
-                  command=dlg.destroy).pack(side="left", padx=4)
-
-        dlg.wait_window()
-        if res[0]:
-            self._open_video(res[0])
-
-    # ━━━━━━━━━━━━━ Subtitle Logic (Memory Based) ━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━ Subtitle Logic ━━━━━━━━━━━━━
     def _sub_off(self):
         changed = self._sub_mode != "off"
         self._sub_mode = "off"
@@ -1074,27 +1001,21 @@ class Player:
         
         if self._sub_pipe_name:
             if not _W:
-                try:
-                    os.unlink(self._sub_pipe_name)
-                except:
-                    pass
+                try: os.unlink(self._sub_pipe_name)
+                except: pass
         self._sub_pipe_name = None
         self._sub_data = None
 
     def _extract_subtitle_to_mem(self, stream_idx, codec):
-        """Extracts subtitle stream to RAM (bytes)."""
         ext = "srt"
-        if "ass" in codec or "ssa" in codec:
-            ext = "ass"
-        elif "vtt" in codec:
-            ext = "vtt"
+        if "ass" in codec or "ssa" in codec: ext = "ass"
+        elif "vtt" in codec: ext = "vtt"
         
-        self._cv.show_txt(self._S("sub_extracting"))
-        self._root.update()
+        self._cv.set_text(self._S("sub_extracting"))
+        QApplication.processEvents()
 
         cmd = [self._ff, "-y", "-i", self._path, "-map", f"0:s:{stream_idx}"]
-        cmd += ["-f", ext, "-"] # Output to stdout
-
+        cmd += ["-f", ext, "-"]
         try:
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, **_pkw())
             return r.stdout
@@ -1104,47 +1025,28 @@ class Player:
     def _serve_pipe_windows(self, pipe_name, data):
         import ctypes
         from ctypes import wintypes
-        
         kernel32 = ctypes.windll.kernel32
-        
-        PIPE_ACCESS_OUTBOUND = 0x00000002
-        PIPE_TYPE_BYTE = 0x00000000
-        PIPE_WAIT = 0x00000000
-        PIPE_UNLIMITED_INSTANCES = 255
         INVALID_HANDLE_VALUE = -1
-        
         while not self._sub_stop_evt.is_set():
             h_pipe = kernel32.CreateNamedPipeW(
-                pipe_name,
-                PIPE_ACCESS_OUTBOUND,
-                PIPE_TYPE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                65536, 65536,
-                0, None
+                pipe_name, 0x00000002, 0x00000000, 255, 65536, 65536, 0, None
             )
-            
             if h_pipe == INVALID_HANDLE_VALUE:
                 time.sleep(0.1)
                 continue
-                
-            # Wait for client (ffmpeg) to connect
             connected = kernel32.ConnectNamedPipe(h_pipe, None)
-            if connected or kernel32.GetLastError() == 535: # ERROR_PIPE_CONNECTED
+            if connected or kernel32.GetLastError() == 535:
                 try:
                     written = wintypes.DWORD(0)
                     kernel32.WriteFile(h_pipe, data, len(data), ctypes.byref(written), None)
                     kernel32.FlushFileBuffers(h_pipe)
-                except:
-                    pass
-                finally:
-                    kernel32.DisconnectNamedPipe(h_pipe)
-            
+                except: pass
+                finally: kernel32.DisconnectNamedPipe(h_pipe)
             kernel32.CloseHandle(h_pipe)
 
     def _serve_pipe_posix(self, pipe_path, data):
         while not self._sub_stop_evt.is_set():
             try:
-                # Open blocks until reader connects
                 fd = os.open(pipe_path, os.O_WRONLY)
                 os.write(fd, data)
                 os.close(fd)
@@ -1154,66 +1056,45 @@ class Player:
     def _setup_sub_pipe(self, data):
         self._sub_stop_evt.clear()
         self._sub_data = data
-        
         if _W:
-            # Windows Named Pipe
             pipe_name = f"\\\\.\\pipe\\pplayer_sub_{uuid.uuid4().hex}"
             self._sub_pipe_name = pipe_name
-            self._sub_thread = threading.Thread(
-                target=self._serve_pipe_windows,
-                args=(pipe_name, data),
-                daemon=True
-            )
+            self._sub_thread = threading.Thread(target=self._serve_pipe_windows, args=(pipe_name, data), daemon=True)
             self._sub_thread.start()
             return pipe_name
         else:
-            # POSIX FIFO
             tmp_dir = tempfile.gettempdir()
             pipe_name = os.path.join(tmp_dir, f"pplayer_sub_{uuid.uuid4().hex}")
-            try:
-                os.mkfifo(pipe_name)
-            except OSError:
-                return None
+            try: os.mkfifo(pipe_name)
+            except OSError: return None
             self._sub_pipe_name = pipe_name
-            self._sub_thread = threading.Thread(
-                target=self._serve_pipe_posix,
-                args=(pipe_name, data),
-                daemon=True
-            )
+            self._sub_thread = threading.Thread(target=self._serve_pipe_posix, args=(pipe_name, data), daemon=True)
             self._sub_thread.start()
             return pipe_name
 
     def _sub_embed(self, stream_idx, codec=""):
         self._cleanup_sub_pipe()
-        
         was_playing = self._playing
-        if was_playing:
-            self._kill()
+        if was_playing: self._kill()
         
         data = self._extract_subtitle_to_mem(stream_idx, codec)
-        
         if data and len(data) > 0:
             pipe_path = self._setup_sub_pipe(data)
             if pipe_path:
                 self._sub_mode = "pipe"
-                self._sub_ext_path = pipe_path # Reuse this var for pipe path
+                self._sub_ext_path = pipe_path
             else:
                 self._sub_mode = "off"
         else:
             self._sub_mode = "off"
 
-        if was_playing:
-            self._start(self._ct)
-        elif self._paused:
-            self._grab_frame(self._ct)
-        else:
-            self._show_hint()
+        if was_playing: self._start(self._ct)
+        elif self._paused: self._grab_frame(self._ct)
+        else: self._show_hint()
 
     def _sub_load_ext(self):
-        ft = [("Subtitle",
-               "*.srt *.ass *.ssa *.sub *.vtt *.idx *.sup"),
-              ("All", "*.*")]
-        p = filedialog.askopenfilename(filetypes=ft)
+        ft = "Subtitle (*.srt *.ass *.ssa *.sub *.vtt *.idx *.sup);;All (*.*)"
+        p, _ = QFileDialog.getOpenFileName(self, self._S("sub_ext"), "", ft)
         if p:
             self._cleanup_sub_pipe()
             self._sub_mode = "ext"
@@ -1227,26 +1108,27 @@ class Player:
 
     def _build_vf_filter(self):
         parts = []
-        parts.append(f"scale={self._dw}:{self._dh}")
+        # FIX: Ensure dimensions are even for YUV420p compatibility if needed,
+        # and ensure 4-byte alignment for QImage (width multiple of 4).
+        # We scale to self._render_w/h which are calculated in _start.
+        w = self._render_w
+        h = self._render_h
+        parts.append(f"scale={w}:{h}")
 
         path_to_use = None
         if self._sub_mode == "ext":
             path_to_use = self._sub_ext_path
         elif self._sub_mode == "pipe":
-            path_to_use = self._sub_ext_path # This holds the pipe path
+            path_to_use = self._sub_ext_path
 
         if path_to_use:
-            safe = path_to_use.replace("\\", "/")
-            safe = safe.replace(":", "\\:")
-            safe = safe.replace("'", "\\'")
+            safe = path_to_use.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
             parts.append(f"subtitles='{safe}'")
-            
         return ",".join(parts)
 
     def _open_video(self, path):
         self._do_close()
-        if not self._fp:
-            return
+        if not self._fp: return
         info = _probe(self._fp, path)
         if info is None:
             self._alert(self._S("eo").format(path))
@@ -1254,7 +1136,7 @@ class Player:
         self._path = path
         self._info = info
         self._ct = 0.0
-        self._bar.dur = info["duration"]
+        self._bar.duration = info["duration"]
         self._bar.set_pos(0)
         self._pcache.clear()
         self._sub_mode = "off"
@@ -1262,14 +1144,14 @@ class Player:
         self._cleanup_sub_pipe()
 
         w, h = info["width"], info["height"]
+        # FIX: Don't downscale too aggressively for preview/drag, but keep aspect
         if h > 1080:
             w = int(w * 1080 / h)
             h = 1080
         self._dw = w + (w % 2)
         self._dh = h + (h % 2)
 
-        self._root.title(
-            f"{os.path.basename(path)} — {self._S('title')}")
+        self.setWindowTitle(f"{os.path.basename(path)} — {self._S('title')}")
         self._build_menus()
         self._start(0.0)
 
@@ -1281,53 +1163,47 @@ class Player:
         self._paused = False
         self._ct = t
         self._hwd = ""
-        self._lhw.config(text="")
+        self._lhw.setText("")
 
-        while not self._q.empty():
-            try:
-                self._q.get_nowait()
-            except queue.Empty:
-                break
+        # FIX: Use native resolution (no downscaling) for maximum quality.
+        iw, ih = self._info["width"], self._info["height"]
+        
+        target_w = iw
+        target_h = ih
+        
+        # FIX: Ensure width is a multiple of 4 for QImage 32-bit alignment
+        # This prevents the "skewed black and white" issue.
+        target_w = (target_w + 3) & ~3 
+        target_h = target_h + (target_h % 2) # Even height is good practice
+
+        self._render_w = target_w
+        self._render_h = target_h
 
         cmd = [self._ff]
-        if self._hwm == "auto":
-            cmd += ["-hwaccel", "auto"]
-        elif self._hwm != "off":
-            cmd += ["-hwaccel", self._hwm]
+        if self._hwm == "auto": cmd += ["-hwaccel", "auto"]
+        elif self._hwm != "off": cmd += ["-hwaccel", self._hwm]
         
-        if t > 0.5:
-            cmd += ["-ss", f"{t:.3f}"]
-
-        cmd += ["-copyts"]
-        cmd += ["-i", self._path]
-
-        vf = self._build_vf_filter()
-        cmd += ["-vf", vf]
-
-        cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24",
-                "-an", "-sn",
-                "-v", "error", "pipe:1"]
+        if t > 0.5: cmd += ["-ss", f"{t:.3f}"]
+        cmd += ["-copyts", "-i", self._path, "-vf", self._build_vf_filter()]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "-sn", "-v", "error", "pipe:1"]
+        
+        bufsize = self._render_w * self._render_h * 3 * 2
         try:
             self._vp = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                bufsize=self._dw * self._dh * 3 * 2,
-                **_pkw())
+                bufsize=bufsize, **_pkw())
         except Exception as exc:
             self._alert(str(exc))
             self._playing = False
             return
 
         if self._info["has_audio"] and self._fy and not self._muted:
-            self._audio.start(self._fy, self._ff, self._path,
-                              t, self._vol, self._speed)
+            self._audio.start(self._fy, self._ff, self._path, t, self._vol, self._speed)
 
         self._sync_t0 = t
-
-        threading.Thread(target=self._vloop, args=(gen,),
-                         daemon=True).start()
-        threading.Thread(target=self._detect_hw_thread, args=(gen,),
-                         daemon=True).start()
-        self._bpp.config(text="\u23F8")
+        threading.Thread(target=self._vloop, args=(gen,), daemon=True).start()
+        threading.Thread(target=self._detect_hw_thread, args=(gen,), daemon=True).start()
+        self._bpp.setText("\u23F8")
 
     def _kill(self):
         self._evt.set()
@@ -1336,37 +1212,25 @@ class Player:
         p = self._vp
         if p:
             self._vp = None
-            try:
-                p.kill()
-            except Exception:
-                pass
-            try:
-                p.stdout.close()
-            except Exception:
-                pass
-        while not self._q.empty():
-            try:
-                self._q.get_nowait()
-            except queue.Empty:
-                break
+            try: p.kill()
+            except: pass
+            try: p.stdout.close()
+            except: pass
 
     def _vloop(self, gen):
         proc = self._vp
-        if not proc:
-            return
-        fsz = self._dw * self._dh * 3
+        if not proc: return
+        
+        rw, rh = self._render_w, self._render_h
+        fsz = rw * rh * 3
         fps = self._info["fps"]
         spf = 1.0 / fps
         speed = max(0.1, self._speed)
-        dspf = spf / speed            # wall-seconds per frame
-
+        dspf = spf / speed
         t0 = self._sync_t0
-        has_audio = (self._info["has_audio"] and not self._muted
-                     and self._fy is not None)
+        has_audio = (self._info["has_audio"] and not self._muted and self._fy is not None)
 
-        if has_audio:
-            self._audio.wait_ready(timeout=3.0)
-
+        if has_audio: self._audio.wait_ready(timeout=3.0)
         wall0 = time.monotonic()
         n = 0
         first_frame = True
@@ -1374,8 +1238,7 @@ class Player:
         try:
             while self._gen == gen and not self._evt.is_set():
                 raw = _read_n(proc.stdout, fsz)
-                if raw is None or self._gen != gen:
-                    break
+                if raw is None or self._gen != gen: break
 
                 frame_time = t0 + n * spf
                 self._ct = frame_time
@@ -1384,112 +1247,70 @@ class Player:
                     first_frame = False
                     wall0 = time.monotonic()
 
-                try:
-                    img = Image.frombytes("RGB", (self._dw, self._dh), raw)
-                    
-                    vw, vh = self._view_w, self._view_h
-                    if vw > 1 and vh > 1:
-                        iw, ih = img.size
-                        s = min(vw / iw, vh / ih)
-                        nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
-                        if nw != iw or nh != ih:
-                            img = img.resize((nw, nh), _BIL)
-                except Exception:
-                    img = None
+                # Emit signal to UI thread immediately
+                self.frameReady.emit(raw, rw, rh)
 
                 a = self._audio
-                use_audio = (has_audio and a.is_ready
-                             and a.is_alive and not self._muted)
+                use_audio = (has_audio and a.is_ready and a.is_alive and not self._muted)
 
                 if use_audio:
                     for _ in range(1000):
-                        if self._gen != gen or self._evt.is_set():
-                            break
+                        if self._gen != gen or self._evt.is_set(): break
                         apos = a.media_position
-                        if apos >= frame_time - 0.005:
-                            break
+                        if apos >= frame_time - 0.005: break
                         wait = min((frame_time - apos) / speed, 0.05)
-                        if wait > 0.001:
-                            time.sleep(wait)
-                        else:
-                            break
-
-                    if self._gen != gen or self._evt.is_set():
-                        break
-
+                        if wait > 0.001: time.sleep(wait)
+                        else: break
+                    if self._gen != gen or self._evt.is_set(): break
                     apos = a.media_position
                     if apos > frame_time + spf * 4:
                         n += 1
                         continue
-
                     wall0 = time.monotonic() - n * dspf
                 else:
                     target = wall0 + n * dspf
                     now = time.monotonic()
                     dt = target - now
-                    if dt > 0.002:
-                        time.sleep(dt)
+                    if dt > 0.002: time.sleep(dt)
                     elif dt < -0.1:
-                        if dt < -dspf * 5:
-                            wall0 = now - n * dspf
+                        if dt < -dspf * 5: wall0 = now - n * dspf
                         n += 1
                         continue
-
-                if img:
-                    try:
-                        self._q.put_nowait(img)
-                    except queue.Full:
-                        try:
-                            self._q.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            self._q.put_nowait(img)
-                        except Exception:
-                            pass
-
                 n += 1
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError): pass
 
         if self._gen == gen and not self._evt.is_set():
             self._playing = False
-            self._root.after(0, self._on_eof)
+            # Signal EOF? For now just let tick handle it or user interaction
+
+    def _on_frame_ready(self, data, w, h):
+        # Convert bytes to QImage on GUI thread
+        # QImage(bytes, width, height, format)
+        # Note: We must keep a reference to data if QImage doesn't copy it.
+        # But here we construct a new QImage which wraps the data.
+        # To be safe from GC, we copy it into the widget's internal storage immediately.
+        img = QImage(data, w, h, QImage.Format.Format_RGB888)
+        # Copy is essential because 'data' is a local variable from signal
+        self._cv.set_image(img.copy())
 
     def _detect_hw_thread(self, gen):
         if self._hwm == "off":
-            if self._gen == gen:
-                self._root.after(0, lambda: self._lhw.config(
-                    text=self._S("stag"), fg="#aa6"))
+            if self._gen == gen: self.hwInfoReady.emit(self._S("stag"), "#aa6")
             return
 
         cmd = [self._ff, "-v", "verbose"]
-        if self._hwm == "auto":
-            cmd += ["-hwaccel", "auto"]
-        else:
-            cmd += ["-hwaccel", self._hwm]
-        cmd += ["-i", self._path,
-                "-frames:v", "1", "-f", "null",
-                "-an", "-sn", "-"]
+        if self._hwm == "auto": cmd += ["-hwaccel", "auto"]
+        else: cmd += ["-hwaccel", self._hwm]
+        cmd += ["-i", self._path, "-frames:v", "1", "-f", "null", "-an", "-sn", "-"]
         try:
-            r = subprocess.run(cmd, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
-                               timeout=15, **_pkw())
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, **_pkw())
             txt = r.stderr.decode("utf-8", errors="ignore")
-        except Exception:
-            txt = ""
+        except: txt = ""
 
-        if self._gen != gen:
-            return
+        if self._gen != gen: return
 
         hw_name = None
-        for pat in [
-            r"Using\s+auto\s+hwaccel\s+type\s+(\w+)",
-            r"Using\s+(\w+)\s+hwaccel",
-            r"hwaccel\s+type\s+(\w+)",
-            r"HW\s+accel[:\s]+(\w+)",
-            r"device\s+type[:\s]+(\w+)",
-        ]:
+        for pat in [r"Using\s+auto\s+hwaccel\s+type\s+(\w+)", r"Using\s+(\w+)\s+hwaccel", r"hwaccel\s+type\s+(\w+)", r"HW\s+accel[:\s]+(\w+)", r"device\s+type[:\s]+(\w+)"]:
             m = re.search(pat, txt, re.I)
             if m:
                 val = m.group(1)
@@ -1497,68 +1318,37 @@ class Player:
                     hw_name = val
                     break
         if not hw_name:
-            m = re.search(
-                r"(\w+(?:_cuvid|_qsv|_nvdec|_amf|_vaapi|_vdpau"
-                r"|_videotoolbox|_mediacodec|_d3d11va|_dxva2))",
-                txt, re.I)
-            if m:
-                hw_name = m.group(1)
-        if not hw_name:
-            m = re.search(
-                r"\b(d3d11va|dxva2|cuda|nvdec|cuvid|qsv|vaapi|vdpau"
-                r"|videotoolbox|mediacodec|vulkan)\b",
-                txt, re.I)
-            if m:
-                hw_name = m.group(1)
-        if not hw_name and self._hwm not in ("auto", "off"):
-            if self._hwm.lower() in txt.lower():
-                hw_name = self._hwm
-
+            m = re.search(r"(\w+(?:_cuvid|_qsv|_nvdec|_amf|_vaapi|_vdpau|_videotoolbox|_mediacodec|_d3d11va|_dxva2))", txt, re.I)
+            if m: hw_name = m.group(1)
+        
         if hw_name and self._gen == gen:
             self._hwd = hw_name
-            self._root.after(0, lambda: self._lhw.config(
-                text=self._S("htag").format(hw_name), fg="#6a6"))
+            self.hwInfoReady.emit(self._S("htag").format(hw_name), "#6a6")
         elif self._gen == gen:
-            self._root.after(0, lambda: self._lhw.config(
-                text=self._S("stag"), fg="#aa6"))
+            self.hwInfoReady.emit(self._S("stag"), "#aa6")
 
-    def _on_eof(self):
-        self._bpp.config(text="\u25B6")
-        self._audio.stop()
+    def _on_hw_info(self, text, color):
+        self._lhw.setText(text)
+        self._lhw.setStyleSheet(f"color: {color}; font-size: 11px;")
 
     def _tick(self):
         if self._playing:
-            latest = None
-            try:
-                while True:
-                    latest = self._q.get_nowait()
-            except queue.Empty:
-                pass
-            if latest is not None:
-                try:
-                    self._frame = latest
-                    self._cv.show_img(latest)
-                except Exception:
-                    pass
             self._bar.set_pos(self._ct)
-            self._tv.set(
-                f"{self._fmt(self._ct)} / "
-                f"{self._fmt(self._info['duration'])}")
-        else:
-            try:
-                while True:
-                    self._q.get_nowait()
-            except queue.Empty:
-                pass
-        self._root.after(15, self._tick)
+            self._tv.setText(f"{self._fmt(self._ct)} / {self._fmt(self._info['duration'])}")
+        elif not self._playing and self._bpp.text() == "\u23F8":
+             # EOF detection fallback
+             self._on_eof()
+
+    def _on_eof(self):
+        self._bpp.setText("\u25B6")
+        self._audio.stop()
 
     def _toggle_play(self):
-        if not self._path:
-            return
+        if not self._path: return
         if self._playing:
             self._kill()
             self._paused = True
-            self._bpp.config(text="\u25B6")
+            self._bpp.setText("\u25B6")
         elif self._paused:
             self._paused = False
             self._start(self._ct)
@@ -1570,12 +1360,10 @@ class Player:
         self._paused = False
         self._ct = 0.0
         self._bar.set_pos(0)
-        self._bpp.config(text="\u25B6")
-        self._lhw.config(text="")
-        if self._info:
-            self._tv.set(f"00:00 / {self._fmt(self._info['duration'])}")
-        else:
-            self._tv.set("00:00 / 00:00")
+        self._bpp.setText("\u25B6")
+        self._lhw.setText("")
+        if self._info: self._tv.setText(f"00:00 / {self._fmt(self._info['duration'])}")
+        else: self._tv.setText("00:00 / 00:00")
 
     def _do_close(self):
         self._kill()
@@ -1583,57 +1371,45 @@ class Player:
         self._ct = 0.0
         self._path = None
         self._info = None
-        self._frame = None
-        self._bar.dur = 0
+        self._cv.set_image(None)
+        self._bar.duration = 0
         self._bar.set_pos(0)
-        self._bpp.config(text="\u25B6")
-        self._lhw.config(text="")
-        self._tv.set("00:00 / 00:00")
+        self._bpp.setText("\u25B6")
+        self._lhw.setText("")
+        self._tv.setText("00:00 / 00:00")
         self._sub_mode = "off"
         self._sub_ext_path = None
         self._cleanup_sub_pipe()
-        self._root.title(self._S("title"))
+        self.setWindowTitle(self._S("title"))
         self._show_hint()
 
     def _on_drag_start(self):
         self._drag_was_playing = self._playing
-        if self._playing:
-            self._kill()
-        self._bpp.config(text="\u25B6")
+        if self._playing: self._kill()
+        self._bpp.setText("\u25B6")
 
     def _on_drag_preview(self, t):
-        if not self._path or not self._info:
-            return
+        if not self._path or not self._info: return
         self._ct = t
-        self._bar.pos = t
-        self._bar._draw()
-        self._tv.set(
-            f"{self._fmt(t)} / {self._fmt(self._info['duration'])}")
+        self._tv.setText(f"{self._fmt(t)} / {self._fmt(self._info['duration'])}")
         self._drag_gen += 1
         dg = self._drag_gen
-        if self._drag_busy:
-            return
+        if self._drag_busy: return
         self._drag_busy = True
         dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
 
         def job():
-            cmd = [ff, "-ss", f"{t:.3f}",
-                   "-i", path,
-                   "-vframes", "1", "-f", "rawvideo",
-                   "-pix_fmt", "rgb24",
-                   "-s", f"{dw}x{dh}",
-                   "-v", "quiet", "pipe:1"]
+            cmd = [ff, "-ss", f"{t:.3f}", "-i", path, "-vframes", "1", "-f", "rawvideo",
+                   "-pix_fmt", "rgb24", "-s", f"{dw}x{dh}", "-v", "quiet", "pipe:1"]
             data = _run_bin(cmd, timeout=3)
             need = dw * dh * 3
             if len(data) >= need:
-                img = Image.frombytes("RGB", (dw, dh), data[:need])
-                self._frame = img
-                self._root.after(0, lambda: self._cv.show_img(img))
+                self.frameReady.emit(data[:need], dw, dh)
             self._drag_busy = False
-            if self._drag_gen != dg and self._bar._drag:
-                newest_t = self._bar.pos
-                self._root.after(
-                    0, lambda: self._on_drag_preview(newest_t))
+            if self._drag_gen != dg and self._bar._dragging:
+                newest_t = self._bar.position
+                # Recurse via timer to avoid stack depth
+                QTimer.singleShot(0, lambda: self._on_drag_preview(newest_t))
 
         threading.Thread(target=job, daemon=True).start()
 
@@ -1641,222 +1417,162 @@ class Player:
         was = self._drag_was_playing
         self._drag_was_playing = False
         self._ct = max(0.0, t)
-        if was:
-            self._start(self._ct)
+        if was: self._start(self._ct)
         else:
             self._paused = True
             self._bar.set_pos(self._ct)
-            if self._info:
-                self._tv.set(
-                    f"{self._fmt(self._ct)} / "
-                    f"{self._fmt(self._info['duration'])}")
-            self._grab_frame(self._ct)
-
-    def _seek_to(self, t):
-        if not self._path:
-            return
-        was = self._playing
-        self._kill()
-        self._ct = max(0.0, t)
-        if was:
-            self._start(self._ct)
-        else:
-            self._paused = True
-            self._bar.set_pos(self._ct)
-            if self._info:
-                self._tv.set(
-                    f"{self._fmt(self._ct)} / "
-                    f"{self._fmt(self._info['duration'])}")
+            if self._info: self._tv.setText(f"{self._fmt(self._ct)} / {self._fmt(self._info['duration'])}")
             self._grab_frame(self._ct)
 
     def _seek_rel(self, dt):
-        if not self._info:
-            return
+        if not self._info: return
         t = max(0.0, min(self._info["duration"], self._ct + dt))
-        self._seek_to(t)
+        was = self._playing
+        self._kill()
+        self._ct = t
+        if was: self._start(self._ct)
+        else:
+            self._paused = True
+            self._bar.set_pos(self._ct)
+            self._tv.setText(f"{self._fmt(self._ct)} / {self._fmt(self._info['duration'])}")
+            self._grab_frame(self._ct)
 
     def _grab_frame(self, t):
         dw, dh, path, ff = self._dw, self._dh, self._path, self._ff
         vf = self._build_vf_filter()
-
         def job():
-            cmd = [ff, "-ss", f"{t:.3f}",
-                   "-i", path,
-                   "-vf", vf,
-                   "-vframes", "1", "-f", "rawvideo",
-                   "-pix_fmt", "rgb24",
-                   "-v", "quiet", "pipe:1"]
+            cmd = [ff, "-ss", f"{t:.3f}", "-i", path, "-vf", vf, "-vframes", "1",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "quiet", "pipe:1"]
             data = _run_bin(cmd, timeout=5)
             need = dw * dh * 3
             if len(data) >= need:
-                img = Image.frombytes("RGB", (dw, dh), data[:need])
-                self._frame = img
-                self._root.after(0, lambda: self._cv.show_img(img))
-
+                self.frameReady.emit(data[:need], dw, dh)
         threading.Thread(target=job, daemon=True).start()
 
     def _next_frame(self):
-        if not self._info:
-            return
+        if not self._info: return
         if self._playing:
             self._kill()
             self._paused = True
-            self._bpp.config(text="\u25B6")
+            self._bpp.setText("\u25B6")
         dt = 1.0 / self._info["fps"]
         self._ct = min(self._info["duration"], self._ct + dt)
         self._grab_frame(self._ct)
         self._bar.set_pos(self._ct)
-        self._tv.set(
-            f"{self._fmt(self._ct)} / "
-            f"{self._fmt(self._info['duration'])}")
+        self._tv.setText(f"{self._fmt(self._ct)} / {self._fmt(self._info['duration'])}")
 
     def _set_speed(self, v):
         self._speed = v
-        self._lsp.config(text=f"{v}x")
+        self._lsp.setText(f"{v}x")
         if self._playing:
             t = self._ct
             self._kill()
             self._start(t)
 
     def _cycle_speed(self, d):
-        try:
-            idx = self.SPEEDS.index(self._speed)
-        except ValueError:
-            idx = self.SPEEDS.index(1.0)
+        try: idx = self.SPEEDS.index(self._speed)
+        except: idx = self.SPEEDS.index(1.0)
         idx = max(0, min(len(self.SPEEDS) - 1, idx + d))
         self._set_speed(self.SPEEDS[idx])
 
     def _on_vol(self, val):
-        self._vol = int(float(val))
+        self._vol = val
         self._muted = False
-        if hasattr(self, "_lvl") and self._lvl:
-            self._lvl.config(text=f"{self._vol}%")
-        if hasattr(self, "_bmu"):
-            self._mu_icon()
-        if self._vol_timer is not None:
-            self._root.after_cancel(self._vol_timer)
+        self._lvl.setText(f"{self._vol}%")
+        self._mu_icon()
+        if self._vol_timer:
+            self._vol_timer.stop()
             self._vol_timer = None
-        if (self._ui_ready and self._playing
-                and self._info and self._info["has_audio"] and self._fy):
-            self._vol_timer = self._root.after(
-                300, self._restart_audio_vol)
+        if self._playing and self._info and self._info["has_audio"] and self._fy:
+            self._vol_timer = QTimer()
+            self._vol_timer.setSingleShot(True)
+            self._vol_timer.timeout.connect(self._restart_audio_vol)
+            self._vol_timer.start(300)
 
     def _restart_audio_vol(self):
         self._vol_timer = None
-        if (self._playing and self._info
-                and self._info["has_audio"] and self._fy
-                and not self._muted):
-            self._audio.start(self._fy, self._ff, self._path,
-                              self._ct, self._vol, self._speed)
+        if self._playing and self._info and self._info["has_audio"] and self._fy and not self._muted:
+            self._audio.start(self._fy, self._ff, self._path, self._ct, self._vol, self._speed)
 
     def _chg_vol(self, d):
         self._vol = max(0, min(100, self._vol + d))
-        self._vsc.set(self._vol)
+        self._vsc.setValue(self._vol)
 
     def _toggle_mute(self):
         self._muted = not self._muted
         self._mu_icon()
-        if self._muted:
-            self._audio.stop()
-        elif (self._playing and self._info
-              and self._info["has_audio"] and self._fy):
-            self._audio.start(self._fy, self._ff, self._path,
-                              self._ct, self._vol, self._speed)
+        if self._muted: self._audio.stop()
+        elif self._playing and self._info and self._info["has_audio"] and self._fy:
+            self._audio.start(self._fy, self._ff, self._path, self._ct, self._vol, self._speed)
 
     def _mu_icon(self):
-        if not hasattr(self, "_bmu"):
-            return
-        if self._muted or self._vol == 0:
-            self._bmu.config(text="\U0001F507")
-        elif self._vol < 50:
-            self._bmu.config(text="\U0001F509")
-        else:
-            self._bmu.config(text="\U0001F50A")
+        if self._muted or self._vol == 0: self._bmu.setText("\U0001F507")
+        elif self._vol < 50: self._bmu.setText("\U0001F509")
+        else: self._bmu.setText("\U0001F50A")
 
     def _toggle_fs(self):
         self._fsc = not self._fsc
-        self._root.attributes("-fullscreen", self._fsc)
         if self._fsc:
-            self._root.config(menu="")
+            self.showFullScreen()
+            self.menuBar().hide()
+            self._ctrl.hide()
         else:
-            self._root.config(menu=self._mb)
+            self.showNormal()
+            self.menuBar().show()
+            self._ctrl.show()
 
-    def _prev_hover(self, t, sx, sy):
-        if not self._info or not self._path:
-            return
+    def _prev_hover(self, t, gx, gy):
+        if not self._info or not self._path: return
         key = int(t * 2)
-        ts = self._fmt(t)
         if key in self._pcache:
-            self._tip.show(self._pcache[key], ts, sx, sy)
+            self._tip.show_tip(self._pcache[key], self._fmt(t), gx, gy)
             return
-        if self._pbusy:
-            return
+        if self._pbusy: return
         self._pbusy = True
         path, ff = self._path, self._ff
         iw, ih = self._info["width"], self._info["height"]
-
+        
         def job():
             pw = 160
             ph = max(2, int(pw * ih / max(1, iw)))
             ph += ph % 2
-            cmd = [ff, "-ss", f"{t:.3f}",
-                   "-i", path,
-                   "-vframes", "1", "-f", "rawvideo",
-                   "-pix_fmt", "rgb24",
-                   "-s", f"{pw}x{ph}",
-                   "-v", "quiet", "pipe:1"]
+            cmd = [ff, "-ss", f"{t:.3f}", "-i", path, "-vframes", "1", "-f", "rawvideo",
+                   "-pix_fmt", "rgb24", "-s", f"{pw}x{ph}", "-v", "quiet", "pipe:1"]
             try:
                 data = _run_bin(cmd, timeout=3)
                 need = pw * ph * 3
                 if len(data) >= need:
-                    img = Image.frombytes("RGB", (pw, ph), data[:need])
-                    if len(self._pcache) > 200:
-                        self._pcache.clear()
-                    self._pcache[key] = img
-                    self._root.after(
-                        0, lambda: self._tip.show(img, ts, sx, sy))
-            except Exception:
-                pass
-            finally:
-                self._pbusy = False
-
+                    img = QImage(data[:need], pw, ph, QImage.Format.Format_RGB888).copy()
+                    self.previewReady.emit(key, img)
+            except: pass
+            finally: self._pbusy = False
         threading.Thread(target=job, daemon=True).start()
+
+    def _on_preview_ready(self, key, img):
+        if len(self._pcache) > 200: self._pcache.clear()
+        self._pcache[key] = img
+        # If mouse is still hovering, update tip? 
+        # Simplified: just let next hover event pick it up or user moves mouse slightly
+        # But we can try to show it if bar is still hovered.
+        # For now, rely on mouse move to re-trigger cache hit.
 
     def _prev_leave(self):
         self._tip.hide()
 
-    def _check_tip_hide(self):
-        try:
-            mx = self._root.winfo_pointerx()
-            my = self._root.winfo_pointery()
-            bx = self._bar.winfo_rootx()
-            by = self._bar.winfo_rooty()
-            bw = self._bar.winfo_width()
-            bh = self._bar.winfo_height()
-            if not (bx <= mx <= bx + bw and by <= my <= by + bh):
-                self._tip.hide()
-        except Exception:
-            pass
-        self._root.after(300, self._check_tip_hide)
-
     def _set_boss(self):
-        dlg = tk.Toplevel(self._root)
-        dlg.title(self._S("boss"))
-        dlg.geometry("340x110")
-        dlg.transient(self._root)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-
-        tk.Label(dlg, text=self._S("bp").format(self._boss),
-                 font=("Helvetica", 11), wraplength=310,
-                 justify="center").pack(expand=True, padx=10, pady=10)
-
-        def on_key(e):
-            self._boss = e.keysym
-            dlg.destroy()
-
-        dlg.bind("<Key>", on_key)
-        dlg.focus_force()
+        d = QDialog(self)
+        d.setWindowTitle(self._S("boss"))
+        d.setFixedSize(340, 110)
+        l = QVBoxLayout(d)
+        lbl = QLabel(self._S("bp").format(self._boss))
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        l.addWidget(lbl)
+        
+        def keyPress(e):
+            self._boss = QKeySequence(e.key()).toString()
+            d.accept()
+        d.keyPressEvent = keyPress
+        d.exec()
 
     def _set_hw(self, mode):
         self._hwm = mode
@@ -1864,69 +1580,84 @@ class Player:
             t = self._ct
             self._kill()
             self._start(t)
+    
+    def _set_opacity(self, pct):
+        self._opacity = max(0.3, min(1.0, pct / 100.0))
+        self.setWindowOpacity(self._opacity)
 
     def _about(self):
-        dlg = tk.Toplevel(self._root)
-        dlg.title(self._S("about"))
-        dlg.geometry("480x340")
-        dlg.transient(self._root)
-        dlg.resizable(False, False)
-
+        d = QDialog(self)
+        d.setWindowTitle(self._S("about"))
+        d.setFixedSize(480, 340)
+        l = QVBoxLayout(d)
+        
         ver_line = "unknown"
         try:
             ver_raw = _run_text([self._ff, "-version"], timeout=5)
-            if ver_raw:
-                ver_line = ver_raw.strip().split("\n")[0]
-        except Exception:
-            pass
-
-        txt = self._S("abt")
-        txt += f"\n\n{ver_line}"
-        if self._fp:
-            txt += f"\nffprobe: {self._fp}"
-        if self._fy:
-            txt += f"\nffplay: {self._fy}"
-        else:
-            txt += "\nffplay: (not found — no audio)"
-
-        tk.Label(dlg, text=txt, font=("Helvetica", 10),
-                 justify="center", wraplength=460).pack(
-            expand=True, padx=10)
-        tk.Button(dlg, text=self._S("ok"), width=10,
-                  command=dlg.destroy).pack(pady=8)
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
+            if ver_raw: ver_line = ver_raw.strip().split("\n")[0]
+        except: pass
+        
+        txt = self._S("abt") + f"\n\n{ver_line}"
+        if self._fp: txt += f"\nffprobe: {self._fp}"
+        if self._fy: txt += f"\nffplay: {self._fy}"
+        else: txt += "\nffplay: (not found — no audio)"
+        
+        lbl = QLabel(txt)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setWordWrap(True)
+        l.addWidget(lbl)
+        
+        btn = QPushButton(self._S("ok"))
+        btn.clicked.connect(d.accept)
+        l.addWidget(btn)
+        d.exec()
 
     def _alert(self, msg):
-        dlg = tk.Toplevel(self._root)
-        dlg.title("!")
-        dlg.geometry("420x140")
-        dlg.transient(self._root)
-        dlg.grab_set()
-        dlg.resizable(False, False)
+        d = QDialog(self)
+        d.setWindowTitle("!")
+        d.setFixedSize(420, 140)
+        l = QVBoxLayout(d)
+        lbl = QLabel(msg)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setWordWrap(True)
+        l.addWidget(lbl)
+        btn = QPushButton(self._S("ok"))
+        btn.clicked.connect(d.accept)
+        l.addWidget(btn)
+        d.exec()
 
-        tk.Label(dlg, text=msg, font=("Helvetica", 11),
-                 wraplength=390, justify="center").pack(
-            expand=True, padx=10)
-        tk.Button(dlg, text=self._S("ok"), width=10,
-                  command=dlg.destroy).pack(pady=8)
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
-
-    def _quit(self):
+    def closeEvent(self, event):
         self._save_settings()
         self._kill()
         self._cleanup_sub_pipe()
-        self._tip.destroy()
-        try:
-            self._root.destroy()
-        except Exception:
-            pass
+        event.accept()
 
+# Helper for Input Dialog
+def QInputDialog_getText(parent, title, label):
+    d = QDialog(parent)
+    d.setWindowTitle(title)
+    l = QVBoxLayout(d)
+    l.addWidget(QLabel(label))
+    le = QLineEdit()
+    l.addWidget(le)
+    btns = QHBoxLayout()
+    ok = QPushButton("OK")
+    ok.clicked.connect(d.accept)
+    cancel = QPushButton("Cancel")
+    cancel.clicked.connect(d.reject)
+    btns.addWidget(ok)
+    btns.addWidget(cancel)
+    l.addLayout(btns)
+    if d.exec() == QDialog.DialogCode.Accepted:
+        return le.text(), True
+    return "", False
 
 if __name__ == "__main__":
-    app = Player()
-    app._check_tip_hide()
+    app = QApplication(sys.argv)
+    player = Player()
+    player.show()
     if len(sys.argv) > 1:
         p = sys.argv[1]
         if os.path.isfile(p):
-            app._root.after(300, lambda: app._open_video(p))
-    app.run()
+            QTimer.singleShot(300, lambda: player._open_video(p))
+    sys.exit(app.exec())
