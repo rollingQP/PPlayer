@@ -16,7 +16,6 @@ import threading
 import re
 import platform
 import atexit
-import socket
 from pathlib import Path
 
 # ── Dependency Checks ──────────────────────────────────────
@@ -365,27 +364,6 @@ class _AudioPlayer:
         except: pass
         self._alive = False
 
-# ━━━━━━━━━━━━━━━ Subtitle Server (Memory) ━━━━━━━━━━━━━━━
-class MemSubServer(threading.Thread):
-    def __init__(self, data):
-        super().__init__(daemon=True)
-        self.data = data
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind(('127.0.0.1', 0))
-        self.port = self.sock.getsockname()[1]
-        self.sock.listen(1)
-
-    def run(self):
-        try:
-            self.sock.settimeout(10)
-            conn, _ = self.sock.accept()
-            with conn:
-                conn.sendall(self.data)
-        except: pass
-        finally:
-            try: self.sock.close()
-            except: pass
-
 # ━━━━━━━━━━━━━━━ OpenGL Video Widget ━━━━━━━━━━━━━━━━━━━
 class YUVOpenGLWidget(QOpenGLWidget):
     doubleClicked = pyqtSignal()
@@ -642,6 +620,7 @@ class Player(QMainWindow):
     frameReady = pyqtSignal(bytes, bytes, bytes, int, int) 
     hwInfoReady = pyqtSignal(str, str)
     previewReady = pyqtSignal(int, object)
+    subtitleExtracted = pyqtSignal(int, bytes, str)
 
     SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
@@ -689,7 +668,6 @@ class Player(QMainWindow):
         self._sub_ext_path = None
         self._sub_stream_idx = -1
         self._sub_data = None
-        self._mem_sub_server = None
 
         if not self._ff:
             print(_L[self._lang]["noff"])
@@ -712,6 +690,7 @@ class Player(QMainWindow):
         self.frameReady.connect(self._on_frame_ready)
         self.hwInfoReady.connect(self._on_hw_info)
         self.previewReady.connect(self._on_preview_ready)
+        self.subtitleExtracted.connect(self._on_subtitle_extracted)
 
         self._vsc.setValue(self._vol)
         self._lsp.setText(f"{self._speed}x")
@@ -874,7 +853,7 @@ class Player(QMainWindow):
         msub.addSeparator()
         if self._info and self._info.get("subs"):
             for sub in self._info["subs"]:
-                # FIX: Accept the boolean signal argument (_) to prevent it from overriding the default idx
+                # FIX: Lambda capture issue. The signal sends a boolean which overrides idx if not handled.
                 self._add_action(msub, sub["label"], lambda _, idx=sub["stream_idx"]: self._sub_embed(idx))
             msub.addSeparator()
         self._add_action(msub, S("sub_ext"), self._sub_load_ext)
@@ -945,15 +924,18 @@ class Player(QMainWindow):
             if self._playing: self._start(self._ct)
 
     def _sub_embed(self, stream_idx):
-        # Extract subtitle to memory to avoid file locking/freezing issues
+        # Extract subtitle to memory in a background thread to avoid freezing UI
         self._kill()
         self._cv.set_text(self._S("sub_extracting"))
-        QApplication.processEvents()
         
         # Determine format based on codec
         sub_info = next((s for s in self._info["subs"] if s["stream_idx"] == stream_idx), None)
         codec = sub_info["codec"].lower() if sub_info else "ass"
         
+        # Start extraction thread
+        threading.Thread(target=self._sub_extract_worker, args=(stream_idx, codec, self._path, self._ff), daemon=True).start()
+
+    def _sub_extract_worker(self, stream_idx, codec, path, ff_exe):
         # Use copy for ASS/SSA to preserve styles and speed up extraction
         # Use srt for others to ensure compatibility
         if "ass" in codec or "ssa" in codec:
@@ -963,26 +945,37 @@ class Player(QMainWindow):
             fmt = "srt"
             extra_args = []
 
-        cmd = [self._ff, "-y", "-i", self._path, "-map", f"0:s:{stream_idx}", "-vn", "-an"] + extra_args + ["-f", fmt, "-"]
+        # Use absolute stream index mapping if possible, but here we use the relative index logic from _probe
+        # Note: _probe logic assigns stream_idx as 0, 1, 2... for subtitle streams.
+        # FFmpeg -map 0:s:X maps to the Xth subtitle stream. This matches our logic.
+        
+        cmd = [ff_exe, "-y", "-i", path, "-map", f"0:s:{stream_idx}", "-vn", "-an", "-dn", "-ignore_unknown"] + extra_args + ["-f", fmt, "-"]
         
         try:
             # Use Popen to capture stderr in case of failure
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **_pkw())
-            out, err = proc.communicate(timeout=30) # Increased timeout for large files
+            # IMPORTANT: Set stdin to DEVNULL to prevent hanging if ffmpeg expects input
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, **_pkw())
+            out, err = proc.communicate(timeout=60) 
             
             if proc.returncode != 0 or not out:
-                err_msg = err.decode("utf-8", errors="ignore")[-500:] # Last 500 chars
-                self._alert(self._S("sub_fail").format(err_msg))
-                self._sub_mode = "off"
+                err_msg = err.decode("utf-8", errors="ignore")[-500:] 
+                self.subtitleExtracted.emit(stream_idx, b"", err_msg)
             else:
-                self._sub_data = out
-                self._sub_mode = "mem"
-                self._sub_stream_idx = stream_idx
-                self._sub_ext_path = None
+                self.subtitleExtracted.emit(stream_idx, out, "")
         except Exception as e:
-            self._alert(self._S("sub_fail").format(str(e)))
+            self.subtitleExtracted.emit(stream_idx, b"", str(e))
+
+    def _on_subtitle_extracted(self, stream_idx, data, error):
+        if error:
+            self._alert(self._S("sub_fail").format(error))
             self._sub_mode = "off"
-        
+            self._start(self._ct) # Resume without subs
+            return
+
+        self._sub_data = data
+        self._sub_mode = "mem"
+        self._sub_stream_idx = stream_idx
+        self._sub_ext_path = None
         self._start(self._ct)
 
     def _sub_load_ext(self):
@@ -1002,18 +995,13 @@ class Player(QMainWindow):
         parts = []
         # Subtitles
         if self._sub_mode == "mem" and self._sub_data:
-            # Serve from memory via local TCP
-            self._mem_sub_server = MemSubServer(self._sub_data)
-            self._mem_sub_server.start()
-            port = self._mem_sub_server.port
-            url = f"tcp://127.0.0.1:{port}"
-            parts.append(f"subtitles=filename='{url}'")
+            # Use pipe:0 (STDIN) to feed subtitles to FFmpeg
+            # This avoids TCP overhead and potential firewall issues
+            parts.append(f"subtitles=filename='pipe:0'")
         elif self._sub_mode == "ext" and self._sub_ext_path:
             safe_path = self._escape_filter_path(self._sub_ext_path)
             parts.append(f"subtitles=filename='{safe_path}'")
         
-        # IMPORTANT: No scaling here! We output native resolution.
-        # But we must ensure dimensions are even for YUV420P
         parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
         return ",".join(parts)
 
@@ -1078,8 +1066,23 @@ class Player(QMainWindow):
         # Buffer size: YUV420P is 1.5 bytes per pixel
         bufsize = int(self._render_w * self._render_h * 1.5 * 4)
         try:
-            self._vp = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=bufsize, **_pkw())
+            # If we have memory subtitles, we need to feed them via STDIN
+            use_stdin = (self._sub_mode == "mem" and self._sub_data)
+            stdin_mode = subprocess.PIPE if use_stdin else subprocess.DEVNULL
+            
+            self._vp = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=stdin_mode, bufsize=bufsize, **_pkw())
             _register_proc(self._vp)
+            
+            if use_stdin:
+                # Write subtitle data to STDIN in a separate thread to avoid blocking
+                def write_subs():
+                    try:
+                        self._vp.stdin.write(self._sub_data)
+                        self._vp.stdin.flush()
+                        self._vp.stdin.close()
+                    except: pass
+                threading.Thread(target=write_subs, daemon=True).start()
+                
         except Exception as exc:
             self._alert(str(exc))
             self._playing = False
@@ -1104,6 +1107,8 @@ class Player(QMainWindow):
             try: p.kill()
             except: pass
             try: p.stdout.close()
+            except: pass
+            try: p.stdin.close() # Ensure stdin is closed
             except: pass
 
     def _vloop(self, gen):
